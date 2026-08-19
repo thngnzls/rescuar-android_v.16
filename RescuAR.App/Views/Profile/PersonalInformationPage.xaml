@@ -4,29 +4,49 @@
     xmlns:x="http://schemas.microsoft.com/winfx/2009/xaml"
     x:Class="RescuAR.App.Views.Profile.PersonalInformationPage"
     Title="Personal Information"
+    Shell.NavBarIsVisible="False"
     BackgroundColor="#F2F2F7">
 
-    <ScrollView>
-        <VerticalStackLayout Spacing="20" Padding="20">
-            <Border StrokeShape="RoundRectangle 15" StrokeThickness="0" BackgroundColor="White" Padding="15">
-                <VerticalStackLayout Spacing="10">
-                    <Label Text="Personal Information" FontAttributes="Bold" FontSize="18" TextColor="Black" />
-                    <Label Text="Manage your public display name (username) and underlying identity details securely." FontSize="12" TextColor="Gray" Margin="0,0,0,10" />
-                    
-                    <Label Text="Username (Public Display Name)" FontAttributes="Bold" FontSize="14" TextColor="Black" />
-                    <Entry Placeholder="e.g. athenanagano" Text="{Binding CurrentUser.Username}" TextColor="Black" />
-                    
-                    <Label Text="First Name" FontAttributes="Bold" FontSize="14" TextColor="Black" Margin="0,10,0,0"/>
-                    <Entry Placeholder="First Name" Text="{Binding CurrentUser.FirstName}" TextColor="Black" />
-                    <Entry Placeholder="Middle Name" Text="{Binding CurrentUser.MiddleName}" TextColor="Black" />
-                    <Entry Placeholder="Last Name" Text="{Binding CurrentUser.LastName}" TextColor="Black" />
-                    <Entry Placeholder="Email" Text="{Binding CurrentUser.Email}" Keyboard="Email" TextColor="Black" />
-                    <Entry Placeholder="Phone Number" Text="{Binding CurrentUser.PhoneNumber}" Keyboard="Telephone" TextColor="Black" />
-                    <Entry Placeholder="Address" Text="{Binding CurrentUser.Address}" TextColor="Black" />
-                </VerticalStackLayout>
-            </Border>
+    <Grid RowDefinitions="Auto,*">
+        <!-- Header -->
+        <Grid Grid.Row="0" ColumnDefinitions="Auto,*,Auto" Padding="20,15,20,15" BackgroundColor="#F2F2F7">
+            <!-- Back Button -->
+            <HorizontalStackLayout Grid.Column="0" Spacing="8" VerticalOptions="Center">
+                <HorizontalStackLayout.GestureRecognizers>
+                    <TapGestureRecognizer Tapped="OnBackTapped" />
+                </HorizontalStackLayout.GestureRecognizers>
+                <!-- SVG Path for Back arrow -->
+                <Path Data="M15 18l-6-6 6-6" Stroke="Black" StrokeThickness="2" StrokeLineCap="Round" StrokeLineJoin="Round" VerticalOptions="Center"/>
+                <Label Text="Back" FontAttributes="Bold" TextColor="Black" FontSize="14" VerticalOptions="Center" />
+            </HorizontalStackLayout>
+            
+            <Label Grid.Column="1" Text="Personal Info" FontAttributes="Bold" TextColor="Black" FontSize="16" HorizontalOptions="Center" VerticalOptions="Center"/>
+            <BoxView Grid.Column="2" WidthRequest="20" HeightRequest="20" Color="Transparent" />
+        </Grid>
 
-            <Button Text="Save Profile Changes" Command="{Binding SaveProfileCommand}" BackgroundColor="#0A8491" TextColor="White" FontAttributes="Bold" CornerRadius="8" HeightRequest="50" />
-        </VerticalStackLayout>
-    </ScrollView>
+        <!-- Main Content -->
+        <ScrollView Grid.Row="1">
+            <VerticalStackLayout Spacing="20" Padding="20">
+                <Border StrokeShape="RoundRectangle 15" StrokeThickness="0" BackgroundColor="White" Padding="15">
+                    <VerticalStackLayout Spacing="10">
+                        <Label Text="Personal Information" FontAttributes="Bold" FontSize="18" TextColor="Black" />
+                        <Label Text="Manage your public display name (username) and underlying identity details securely." FontSize="12" TextColor="Gray" Margin="0,0,0,10" />
+                        
+                        <Label Text="Username (Public Display Name)" FontAttributes="Bold" FontSize="14" TextColor="Black" />
+                        <Entry Placeholder="e.g. athenanagano" Text="{Binding CurrentUser.Username}" TextColor="Black" />
+                        
+                        <Label Text="First Name" FontAttributes="Bold" FontSize="14" TextColor="Black" Margin="0,10,0,0"/>
+                        <Entry Placeholder="First Name" Text="{Binding CurrentUser.FirstName}" TextColor="Black" />
+                        <Entry Placeholder="Middle Name" Text="{Binding CurrentUser.MiddleName}" TextColor="Black" />
+                        <Entry Placeholder="Last Name" Text="{Binding CurrentUser.LastName}" TextColor="Black" />
+                        <Entry Placeholder="Email" Text="{Binding CurrentUser.Email}" Keyboard="Email" TextColor="Black" />
+                        <Entry Placeholder="Phone Number" Text="{Binding CurrentUser.PhoneNumber}" Keyboard="Telephone" TextColor="Black" />
+                        <Entry Placeholder="Address" Text="{Binding CurrentUser.Address}" TextColor="Black" />
+                    </VerticalStackLayout>
+                </Border>
+
+                <Button Text="Save Profile Changes" Command="{Binding SaveProfileCommand}" BackgroundColor="#0A8491" TextColor="White" FontAttributes="Bold" CornerRadius="8" HeightRequest="50" />
+            </VerticalStackLayout>
+        </ScrollView>
+    </Grid>
 </ContentPage>

@@ -23,7 +23,7 @@
             ContentTemplate="{DataTemplate dashboard:DashboardPage}" />
 
         <ShellContent
-            Title="Map"
+            Title="Circle"
             Icon="tab_map.png"
             Route="Map"
             ContentTemplate="{DataTemplate map:MapPage}" />

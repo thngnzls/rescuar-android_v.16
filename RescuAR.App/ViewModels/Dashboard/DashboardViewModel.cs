@@ -64,6 +64,9 @@ public partial class DashboardViewModel : ObservableObject
     [ObservableProperty]
     public partial bool IsPopupVisible { get; set; }
 
+    [ObservableProperty]
+    public partial bool IsPermissionsPopupVisible { get; set; }
+
     public DashboardViewModel()
     {
         _weatherService = WeatherService.Instance;
@@ -102,6 +105,13 @@ public partial class DashboardViewModel : ObservableObject
         if (hour < 12) Greeting = "Good morning,";
         else if (hour < 18) Greeting = "Good afternoon,";
         else Greeting = "Good evening,";
+
+        // Check if permissions have been requested before
+        bool hasRequestedPermissions = Preferences.Get("HasRequestedPermissions", false);
+        if (!hasRequestedPermissions)
+        {
+            IsPermissionsPopupVisible = true;
+        }
 
         // Load live Open-Meteo weather forecast
         MainThread.BeginInvokeOnMainThread(async () =>
@@ -233,6 +243,26 @@ public partial class DashboardViewModel : ObservableObject
         if (Shell.Current != null)
         {
             await Shell.Current.GoToAsync("AdvisoryFeedPage");
+        }
+    }
+
+    [RelayCommand]
+    private async Task GrantPermissionsAsync()
+    {
+        try
+        {
+            await Permissions.RequestAsync<Permissions.LocationWhenInUse>();
+            await Permissions.RequestAsync<Permissions.Camera>();
+            // Note: Push Notifications permission depends on OS version, handled in native code usually, but can be requested here if defined.
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"Error requesting permissions: {ex.Message}");
+        }
+        finally
+        {
+            Preferences.Set("HasRequestedPermissions", true);
+            IsPermissionsPopupVisible = false;
         }
     }
 }

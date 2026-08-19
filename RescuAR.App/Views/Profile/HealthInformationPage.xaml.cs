@@ -45,6 +45,11 @@ namespace RescuAR.App.Views.Profile
             BindingContext = new ProfileViewModel();
         }
 
+        private async void OnBackTapped(object sender, TappedEventArgs e)
+        {
+            await Shell.Current.GoToAsync("..");
+        }
+
         protected override void OnAppearing()
         {
             base.OnAppearing();

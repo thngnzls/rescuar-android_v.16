@@ -101,14 +101,10 @@ namespace RescuAR.App.ViewModels.Authentication
         [RelayCommand]
         private void Next()
         {
-            if (CurrentSlideIndex < 2)
+            if (CurrentSlideIndex < 3)
             {
                 CurrentSlideIndex++;
                 UpdateSlideData();
-            }
-            else
-            {
-                NavigateToSplash();
             }
         }
 
@@ -125,19 +121,8 @@ namespace RescuAR.App.ViewModels.Authentication
         [RelayCommand]
         private void Skip()
         {
-            NavigateToSplash();
-        }
-
-        private void NavigateToSplash()
-        {
-            var splashPage = _serviceProvider.GetRequiredService<SplashPage>();
-            MainThread.BeginInvokeOnMainThread(async () =>
-            {
-                if (Application.Current?.MainPage is NavigationPage navPage)
-                {
-                    await navPage.PushAsync(splashPage);
-                }
-            });
+            CurrentSlideIndex = 3;
+            UpdateSlideData();
         }
 
         [RelayCommand]

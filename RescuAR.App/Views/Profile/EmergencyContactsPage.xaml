@@ -6,23 +6,56 @@
     Title="Emergency Contacts"
     BackgroundColor="#F2F2F7">
 
-    <ScrollView>
-        <VerticalStackLayout Spacing="20" Padding="20">
-            <Border StrokeShape="RoundRectangle 15" StrokeThickness="0" BackgroundColor="White" Padding="15">
-                <VerticalStackLayout Spacing="10">
-                    <Label Text="Emergency Contacts" FontAttributes="Bold" FontSize="18" TextColor="Black" />
-                    
-                    <Label Text="Contact 1" FontAttributes="Bold" TextColor="Gray" FontSize="12" />
-                    <Entry Placeholder="Name" Text="{Binding CurrentUser.EmergencyContact1Name}" TextColor="Black" />
-                    <Entry Placeholder="Phone" Text="{Binding CurrentUser.EmergencyContact1Phone}" Keyboard="Telephone" TextColor="Black" />
+    <Grid RowDefinitions="Auto,*">
+        
+        <!-- Header -->
+        <Grid Grid.Row="0" ColumnDefinitions="Auto,*,Auto" Padding="20,15,20,15" BackgroundColor="#F2F2F7">
+            <!-- Back Button -->
+            <HorizontalStackLayout Grid.Column="0" Spacing="8" VerticalOptions="Center">
+                <HorizontalStackLayout.GestureRecognizers>
+                    <TapGestureRecognizer Tapped="OnBackTapped" />
+                </HorizontalStackLayout.GestureRecognizers>
+                <!-- SVG Path for Back arrow -->
+                <Path Data="M15 18l-6-6 6-6" Stroke="Black" StrokeThickness="2" StrokeLineCap="Round" StrokeLineJoin="Round" VerticalOptions="Center"/>
+                <Label Text="Back" FontAttributes="Bold" TextColor="Black" FontSize="14" VerticalOptions="Center" />
+            </HorizontalStackLayout>
+            
+            <Label Grid.Column="1" Text="Emergency Contacts" FontAttributes="Bold" TextColor="Black" FontSize="16" HorizontalOptions="Center" VerticalOptions="Center"/>
+            <BoxView Grid.Column="2" WidthRequest="20" HeightRequest="20" Color="Transparent" />
+        </Grid>
 
-                    <Label Text="Contact 2" FontAttributes="Bold" TextColor="Gray" FontSize="12" Margin="0,10,0,0"/>
-                    <Entry Placeholder="Name" Text="{Binding CurrentUser.EmergencyContact2Name}" TextColor="Black" />
-                    <Entry Placeholder="Phone" Text="{Binding CurrentUser.EmergencyContact2Phone}" Keyboard="Telephone" TextColor="Black" />
-                </VerticalStackLayout>
-            </Border>
+        <ScrollView Grid.Row="1">
+            <VerticalStackLayout Spacing="20" Padding="20">
+                <Border StrokeShape="RoundRectangle 15" StrokeThickness="0" BackgroundColor="White" Padding="15">
+                    <VerticalStackLayout Spacing="10">
+                        <Label Text="Contact 1" FontAttributes="Bold" TextColor="Gray" FontSize="12" />
+                        <Entry Placeholder="Name" Text="{Binding CurrentUser.EmergencyContact1Name}" TextColor="Black" />
+                        <Grid ColumnDefinitions="*,Auto" ColumnSpacing="10">
+                            <Entry Grid.Column="0" Placeholder="Phone" Text="{Binding CurrentUser.EmergencyContact1Phone}" Keyboard="Telephone" TextColor="Black" />
+                            <ImageButton Grid.Column="1" Clicked="OnCallContact1Clicked" Source="dotnet_bot.png" WidthRequest="40" HeightRequest="40" BackgroundColor="#0A8491" CornerRadius="20" Padding="8">
+                                <ImageButton.Source>
+                                    <FontImageSource FontFamily="OpenSansRegular" Glyph="📞" Color="White" Size="20" />
+                                </ImageButton.Source>
+                            </ImageButton>
+                        </Grid>
 
-            <Button Text="Save Contacts" Command="{Binding SaveProfileCommand}" BackgroundColor="#0A8491" TextColor="White" FontAttributes="Bold" CornerRadius="8" HeightRequest="50" />
-        </VerticalStackLayout>
-    </ScrollView>
+                        <BoxView HeightRequest="1" BackgroundColor="#F1F5F9" Margin="0,10" />
+
+                        <Label Text="Contact 2" FontAttributes="Bold" TextColor="Gray" FontSize="12" />
+                        <Entry Placeholder="Name" Text="{Binding CurrentUser.EmergencyContact2Name}" TextColor="Black" />
+                        <Grid ColumnDefinitions="*,Auto" ColumnSpacing="10">
+                            <Entry Grid.Column="0" Placeholder="Phone" Text="{Binding CurrentUser.EmergencyContact2Phone}" Keyboard="Telephone" TextColor="Black" />
+                            <ImageButton Grid.Column="1" Clicked="OnCallContact2Clicked" Source="dotnet_bot.png" WidthRequest="40" HeightRequest="40" BackgroundColor="#0A8491" CornerRadius="20" Padding="8">
+                                <ImageButton.Source>
+                                    <FontImageSource FontFamily="OpenSansRegular" Glyph="📞" Color="White" Size="20" />
+                                </ImageButton.Source>
+                            </ImageButton>
+                        </Grid>
+                    </VerticalStackLayout>
+                </Border>
+
+                <Button Text="Save Contacts" Command="{Binding SaveProfileCommand}" BackgroundColor="#0A8491" TextColor="White" FontAttributes="Bold" CornerRadius="8" HeightRequest="50" />
+            </VerticalStackLayout>
+        </ScrollView>
+    </Grid>
 </ContentPage>

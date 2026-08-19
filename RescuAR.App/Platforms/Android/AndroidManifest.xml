@@ -15,6 +15,7 @@
         android:allowBackup="true"
         android:icon="@mipmap/appicon"
         android:supportsRtl="true"
+        android:extractNativeLibs="true"
         android:label="RescuAR">
 	</application>
 

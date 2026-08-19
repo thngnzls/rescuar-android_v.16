@@ -2,8 +2,8 @@
 
 	<PropertyGroup>
 		<TargetFrameworks>net10.0-android</TargetFrameworks>
-		<TargetFrameworks Condition="!$([MSBuild]::IsOSPlatform('linux'))">$(TargetFrameworks);net10.0-ios;net10.0-maccatalyst</TargetFrameworks>
-		<TargetFrameworks Condition="$([MSBuild]::IsOSPlatform('windows'))">$(TargetFrameworks);net10.0-windows10.0.19041.0</TargetFrameworks>
+		<!-- <TargetFrameworks Condition="!$([MSBuild]::IsOSPlatform('linux'))">$(TargetFrameworks);net10.0-ios;net10.0-maccatalyst</TargetFrameworks> -->
+		<!-- <TargetFrameworks Condition="$([MSBuild]::IsOSPlatform('windows'))">$(TargetFrameworks);net10.0-windows10.0.19041.0</TargetFrameworks> -->
 
 		<!-- Note for MacCatalyst:
 		The default runtime is maccatalyst-x64, except in Release config, in which case the default is maccatalyst-x64;maccatalyst-arm64.
@@ -43,10 +43,10 @@
 		<SupportedOSPlatformVersion Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'ios'">15.0</SupportedOSPlatformVersion>
 		<SupportedOSPlatformVersion Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'maccatalyst'">15.0</SupportedOSPlatformVersion>
 		<SupportedOSPlatformVersion Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'android'">26.0</SupportedOSPlatformVersion>
+		<AndroidEnable16kbPageSize>true</AndroidEnable16kbPageSize>
+		<AndroidEnableNativeCompression>false</AndroidEnableNativeCompression>
 		<SupportedOSPlatformVersion Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'windows'">10.0.18362.0</SupportedOSPlatformVersion>
 		<TargetPlatformMinVersion Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'windows'">10.0.18362.0</TargetPlatformMinVersion>
-		<!-- Disable Fast Deployment for command-line runs to embed all DLLs inside the APK -->
-		<EmbedAssembliesIntoApk>true</EmbedAssembliesIntoApk>
 	</PropertyGroup>
 
 	<ItemGroup>
@@ -77,8 +77,11 @@
 		<PackageReference Include="Supabase" Version="1.1.1" />
 		<!-- Restored Map and Local Database Packages -->
 		<PackageReference Include="Mapsui.Maui" Version="4.1.8" />
-		<PackageReference Include="SkiaSharp.Views.Maui.Controls" Version="2.88.9-preview.2.2" />
+		<PackageReference Include="SkiaSharp.Views.Maui.Controls" Version="3.116.1" />
+		<PackageReference Include="SkiaSharp.HarfBuzz" Version="3.116.1" />
 		<PackageReference Include="sqlite-net-pcl" Version="1.9.172" />
+		<PackageReference Include="SQLitePCLRaw.bundle_e_sqlite3" Version="2.1.10" />
+		<PackageReference Include="SQLitePCLRaw.core" Version="2.1.10" />
 	</ItemGroup>
 
 	<ItemGroup>

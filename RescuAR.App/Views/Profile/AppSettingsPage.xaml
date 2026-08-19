@@ -1,13 +1,90 @@
 <?xml version="1.0" encoding="utf-8" ?>
-
 <ContentPage
     xmlns="http://schemas.microsoft.com/dotnet/2021/maui"
     xmlns:x="http://schemas.microsoft.com/winfx/2009/xaml"
+    xmlns:vm="clr-namespace:RescuAR.App.ViewModels.Profile"
     x:Class="RescuAR.App.Views.Profile.AppSettingsPage"
-    Title="App Settings">
+    Shell.NavBarIsVisible="False"
+    BackgroundColor="#F2F2F7">
 
-    <VerticalStackLayout>
-        <Label Text="Placeholder" />
-    </VerticalStackLayout>
+    <ContentPage.BindingContext>
+        <vm:AppSettingsViewModel />
+    </ContentPage.BindingContext>
 
+    <Grid RowDefinitions="Auto,*">
+        
+        <!-- Header -->
+        <Grid Grid.Row="0" ColumnDefinitions="Auto,*,Auto" Padding="20,15,20,15" BackgroundColor="#F2F2F7">
+            <!-- Back Button -->
+            <HorizontalStackLayout Grid.Column="0" Spacing="8" VerticalOptions="Center">
+                <HorizontalStackLayout.GestureRecognizers>
+                    <TapGestureRecognizer Tapped="OnBackTapped" />
+                </HorizontalStackLayout.GestureRecognizers>
+                <!-- SVG Path for Back arrow -->
+                <Path Data="M15 18l-6-6 6-6" Stroke="Black" StrokeThickness="2" StrokeLineCap="Round" StrokeLineJoin="Round" VerticalOptions="Center"/>
+                <Label Text="Back" FontAttributes="Bold" TextColor="Black" FontSize="14" VerticalOptions="Center" />
+            </HorizontalStackLayout>
+            
+            <!-- Title -->
+            <Label Grid.Column="1" Text="App Settings" FontAttributes="Bold" TextColor="Black" FontSize="16" HorizontalOptions="Center" VerticalOptions="Center"/>
+            
+            <!-- Bell Icon placeholder to balance grid -->
+            <BoxView Grid.Column="2" WidthRequest="20" HeightRequest="20" Color="Transparent" />
+        </Grid>
+
+        <ScrollView Grid.Row="1" Padding="20">
+            <VerticalStackLayout Spacing="20">
+                <Border StrokeShape="RoundRectangle 15" StrokeThickness="0" BackgroundColor="White" Padding="15">
+                    <VerticalStackLayout Spacing="10">
+                        <Label Text="Permissions" FontAttributes="Bold" FontSize="18" TextColor="Black" Margin="0,0,0,10"/>
+                        
+                        <!-- Camera Toggle -->
+                        <Grid ColumnDefinitions="*,Auto" Padding="0,5">
+                            <VerticalStackLayout Grid.Column="0" VerticalOptions="Center">
+                                <Label Text="Camera Access" TextColor="Black" FontAttributes="Bold" FontSize="14"/>
+                                <Label Text="Required for AR navigation" TextColor="Gray" FontSize="12"/>
+                            </VerticalStackLayout>
+                            <Switch Grid.Column="1" IsToggled="{Binding IsCameraEnabled}" OnColor="#0A8491" />
+                        </Grid>
+                        
+                        <BoxView HeightRequest="1" BackgroundColor="#F1F5F9" Margin="0,5" />
+
+                        <!-- Location Toggle -->
+                        <Grid ColumnDefinitions="*,Auto" Padding="0,5">
+                            <VerticalStackLayout Grid.Column="0" VerticalOptions="Center">
+                                <Label Text="Location Services" TextColor="Black" FontAttributes="Bold" FontSize="14"/>
+                                <Label Text="Required for tracking and routes" TextColor="Gray" FontSize="12"/>
+                            </VerticalStackLayout>
+                            <Switch Grid.Column="1" IsToggled="{Binding IsLocationEnabled}" OnColor="#0A8491" />
+                        </Grid>
+
+                        <BoxView HeightRequest="1" BackgroundColor="#F1F5F9" Margin="0,5" />
+
+                        <!-- Motion Toggle -->
+                        <Grid ColumnDefinitions="*,Auto" Padding="0,5">
+                            <VerticalStackLayout Grid.Column="0" VerticalOptions="Center">
+                                <Label Text="Motion &amp; Sensors" TextColor="Black" FontAttributes="Bold" FontSize="14"/>
+                                <Label Text="Required to align AR directions" TextColor="Gray" FontSize="12"/>
+                            </VerticalStackLayout>
+                            <Switch Grid.Column="1" IsToggled="{Binding IsMotionEnabled}" OnColor="#0A8491" />
+                        </Grid>
+
+                        <BoxView HeightRequest="1" BackgroundColor="#F1F5F9" Margin="0,5" />
+
+                        <!-- Notifications Toggle -->
+                        <Grid ColumnDefinitions="*,Auto" Padding="0,5">
+                            <VerticalStackLayout Grid.Column="0" VerticalOptions="Center">
+                                <Label Text="Push Notifications" TextColor="Black" FontAttributes="Bold" FontSize="14"/>
+                                <Label Text="Important hazard updates" TextColor="Gray" FontSize="12"/>
+                            </VerticalStackLayout>
+                            <Switch Grid.Column="1" IsToggled="{Binding IsNotificationsEnabled}" OnColor="#0A8491" />
+                        </Grid>
+
+                    </VerticalStackLayout>
+                </Border>
+                
+                <Label Text="Note: Toggling permissions will open device settings as required by Android/iOS security policies." TextColor="Gray" FontSize="11" HorizontalTextAlignment="Center" Margin="20,0" />
+            </VerticalStackLayout>
+        </ScrollView>
+    </Grid>
 </ContentPage>

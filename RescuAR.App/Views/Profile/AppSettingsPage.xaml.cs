@@ -8,5 +8,19 @@ namespace RescuAR.App.Views.Profile
         {
             InitializeComponent();
         }
+
+        protected override async void OnAppearing()
+        {
+            base.OnAppearing();
+            if (BindingContext is RescuAR.App.ViewModels.Profile.AppSettingsViewModel vm)
+            {
+                await vm.LoadPermissionsAsync();
+            }
+        }
+
+        private async void OnBackTapped(object sender, TappedEventArgs e)
+        {
+            await Shell.Current.GoToAsync("..");
+        }
     }
 }

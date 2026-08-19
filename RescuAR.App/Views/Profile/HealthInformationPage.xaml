@@ -5,11 +5,28 @@
     xmlns:local="clr-namespace:RescuAR.App.Views.Profile"
     x:Class="RescuAR.App.Views.Profile.HealthInformationPage"
     Title="Health Information"
+    Shell.NavBarIsVisible="False"
     BackgroundColor="#F2F2F7">
 
-    <Grid>
+    <Grid RowDefinitions="Auto,*">
+        <!-- Header -->
+        <Grid Grid.Row="0" ColumnDefinitions="Auto,*,Auto" Padding="20,15,20,15" BackgroundColor="#F2F2F7">
+            <!-- Back Button -->
+            <HorizontalStackLayout Grid.Column="0" Spacing="8" VerticalOptions="Center">
+                <HorizontalStackLayout.GestureRecognizers>
+                    <TapGestureRecognizer Tapped="OnBackTapped" />
+                </HorizontalStackLayout.GestureRecognizers>
+                <!-- SVG Path for Back arrow -->
+                <Path Data="M15 18l-6-6 6-6" Stroke="Black" StrokeThickness="2" StrokeLineCap="Round" StrokeLineJoin="Round" VerticalOptions="Center"/>
+                <Label Text="Back" FontAttributes="Bold" TextColor="Black" FontSize="14" VerticalOptions="Center" />
+            </HorizontalStackLayout>
+            
+            <Label Grid.Column="1" Text="Health Info" FontAttributes="Bold" TextColor="Black" FontSize="16" HorizontalOptions="Center" VerticalOptions="Center"/>
+            <BoxView Grid.Column="2" WidthRequest="20" HeightRequest="20" Color="Transparent" />
+        </Grid>
+
         <!-- Main Content -->
-        <ScrollView>
+        <ScrollView Grid.Row="1">
             <VerticalStackLayout Spacing="20" Padding="20">
                 <Border StrokeShape="RoundRectangle 15" StrokeThickness="0" BackgroundColor="White" Padding="15">
                     <VerticalStackLayout Spacing="10">

@@ -5,19 +5,20 @@ namespace RescuAR.App.Views.Map
 {
     public partial class MapPage : ContentPage
     {
-        public MapPage()
+        public MapPage(MapViewModel viewModel)
         {
             InitializeComponent();
-            BindingContext = new MapViewModel();
+            BindingContext = viewModel;
         }
 
         protected override async void OnAppearing()
         {
             base.OnAppearing();
             
-            if (BindingContext is ViewModels.Map.MapViewModel vm)
+            if (BindingContext is MapViewModel vm)
             {
                 await vm.InitializeMapAsync(MapControl);
+                await vm.LoadMyCirclesAsync();
             }
         }
     }

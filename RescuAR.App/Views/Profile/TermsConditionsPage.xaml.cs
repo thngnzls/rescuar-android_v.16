@@ -8,5 +8,10 @@ namespace RescuAR.App.Views.Profile
         {
             InitializeComponent();
         }
+
+        private async void OnBackTapped(object sender, TappedEventArgs e)
+        {
+            await Shell.Current.GoToAsync("..");
+        }
     }
 }

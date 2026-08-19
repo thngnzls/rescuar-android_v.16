@@ -10,5 +10,10 @@ namespace RescuAR.App.Views.Profile
             InitializeComponent();
             BindingContext = new ProfileViewModel();
         }
+
+        private async void OnBackTapped(object sender, TappedEventArgs e)
+        {
+            await Shell.Current.GoToAsync("..");
+        }
     }
 }

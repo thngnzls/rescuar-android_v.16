@@ -24,8 +24,6 @@ public partial class AppShell : Shell
         Routing.RegisterRoute("TermsConditionsPage", typeof(Views.Profile.TermsConditionsPage));
         Routing.RegisterRoute("SystemInformationPage", typeof(Views.Profile.SystemInformationPage));
         
-        Routing.RegisterRoute("Reports/CommunityPosting", typeof(Views.Reports.CommunityPostingPage));
-        Routing.RegisterRoute(nameof(RescuAR.App.Views.Map.CircleChatPage), typeof(RescuAR.App.Views.Map.CircleChatPage));
         Routing.RegisterRoute("ReportDetails", typeof(Views.Reports.ReportDetailsPage));
         Routing.RegisterRoute("SafetyCirclePage", typeof(Views.Map.SafetyCirclePage));
         Routing.RegisterRoute("SummaryPage", typeof(Views.Summary.SummaryPage));

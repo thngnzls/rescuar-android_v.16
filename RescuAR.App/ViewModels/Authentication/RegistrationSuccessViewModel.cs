@@ -19,12 +19,12 @@ namespace RescuAR.App.ViewModels.Authentication
         [RelayCommand]
         private void Continue()
         {
-            var loginPage = _serviceProvider.GetRequiredService<LoginPage>();
             MainThread.BeginInvokeOnMainThread(() =>
             {
+                var loginPage = _serviceProvider.GetRequiredService<LoginPage>();
                 if (Application.Current != null)
                 {
-                    Application.Current.MainPage = loginPage;
+                    Application.Current.MainPage = new NavigationPage(loginPage);
                 }
             });
         }
