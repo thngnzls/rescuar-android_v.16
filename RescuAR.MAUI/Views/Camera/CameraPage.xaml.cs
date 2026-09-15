@@ -8775,5 +8775,198 @@ namespace RescuAR.App.Views.Camera
                 $"routeVisibleExpected={routeShouldBeVisible}");
 #endif
         }
+
+        #region Navigation & Awareness Event Handlers
+
+        private void OnCameraHeaderBackClicked(object sender, EventArgs e)
+        {
+            if (Shell.Current != null)
+            {
+                Shell.Current.GoToAsync("//DashboardPage");
+            }
+        }
+
+        private void OnCameraSettingsClicked(object sender, EventArgs e)
+        {
+            if (Shell.Current != null)
+            {
+                Shell.Current.GoToAsync("AppSettingsPage");
+            }
+        }
+
+        private void OnCameraNotificationsClicked(object sender, EventArgs e)
+        {
+            if (Shell.Current != null)
+            {
+                Shell.Current.GoToAsync("NotificationsPage");
+            }
+        }
+
+        private void OnNavigationAwarenessClicked(object sender, EventArgs e)
+        {
+            if (navigationAwarenessSheet != null)
+            {
+                navigationAwarenessSheet.IsVisible = true;
+            }
+        }
+
+        private void OnNavigationAwarenessCloseClicked(object sender, EventArgs e)
+        {
+            if (navigationAwarenessSheet != null)
+            {
+                navigationAwarenessSheet.IsVisible = false;
+            }
+        }
+
+        private void OnArGuidanceOptionClicked(object sender, EventArgs e)
+        {
+            if (mapModeLayer != null) mapModeLayer.IsVisible = false;
+            if (floodVisualizationLayer != null) floodVisualizationLayer.IsVisible = false;
+            if (floodWaitingBanner != null) floodWaitingBanner.IsVisible = false;
+
+            if (arGuidanceSelectedIcon != null) arGuidanceSelectedIcon.IsVisible = true;
+            if (mapGuidanceSelectedIcon != null) mapGuidanceSelectedIcon.IsVisible = false;
+            if (floodGuidanceSelectedIcon != null) floodGuidanceSelectedIcon.IsVisible = false;
+
+            if (cameraModeSwitcherMapIcon != null) cameraModeSwitcherMapIcon.IsVisible = true;
+            if (cameraModeSwitcherFloodIcon != null) cameraModeSwitcherFloodIcon.IsVisible = false;
+
+            if (navigationAwarenessSheet != null) navigationAwarenessSheet.IsVisible = false;
+        }
+
+        private void OnMapGuidanceOptionClicked(object sender, EventArgs e)
+        {
+            if (mapModeLayer != null) mapModeLayer.IsVisible = true;
+            if (floodVisualizationLayer != null) floodVisualizationLayer.IsVisible = false;
+            if (floodWaitingBanner != null) floodWaitingBanner.IsVisible = false;
+
+            if (arGuidanceSelectedIcon != null) arGuidanceSelectedIcon.IsVisible = false;
+            if (mapGuidanceSelectedIcon != null) mapGuidanceSelectedIcon.IsVisible = true;
+            if (floodGuidanceSelectedIcon != null) floodGuidanceSelectedIcon.IsVisible = false;
+
+            if (cameraModeSwitcherMapIcon != null) cameraModeSwitcherMapIcon.IsVisible = true;
+            if (cameraModeSwitcherFloodIcon != null) cameraModeSwitcherFloodIcon.IsVisible = false;
+
+            if (navigationAwarenessSheet != null) navigationAwarenessSheet.IsVisible = false;
+
+            // Initialize 2D Map Control if needed
+            Initialize2DCameraMap();
+        }
+
+        private void OnFloodGuidanceOptionClicked(object sender, EventArgs e)
+        {
+            if (mapModeLayer != null) mapModeLayer.IsVisible = false;
+            if (floodVisualizationLayer != null) floodVisualizationLayer.IsVisible = true;
+
+            if (arGuidanceSelectedIcon != null) arGuidanceSelectedIcon.IsVisible = false;
+            if (mapGuidanceSelectedIcon != null) mapGuidanceSelectedIcon.IsVisible = false;
+            if (floodGuidanceSelectedIcon != null) floodGuidanceSelectedIcon.IsVisible = true;
+
+            if (cameraModeSwitcherMapIcon != null) cameraModeSwitcherMapIcon.IsVisible = false;
+            if (cameraModeSwitcherFloodIcon != null) cameraModeSwitcherFloodIcon.IsVisible = true;
+
+            if (navigationAwarenessSheet != null) navigationAwarenessSheet.IsVisible = false;
+        }
+
+        private void OnCameraZoomInClicked(object sender, EventArgs e)
+        {
+            if (currentCameraZoomLevelIndex < CameraZoomLevels.Length - 1)
+            {
+                currentCameraZoomLevelIndex++;
+                if (cameraZoomRatioLabel != null)
+                {
+                    cameraZoomRatioLabel.Text = $"{CameraZoomLevels[currentCameraZoomLevelIndex]}x";
+                }
+            }
+        }
+
+        private void OnCameraZoomOutClicked(object sender, EventArgs e)
+        {
+            if (currentCameraZoomLevelIndex > 0)
+            {
+                currentCameraZoomLevelIndex--;
+                if (cameraZoomRatioLabel != null)
+                {
+                    cameraZoomRatioLabel.Text = $"{CameraZoomLevels[currentCameraZoomLevelIndex]}x";
+                }
+            }
+        }
+
+        private void OnCameraFlashlightClicked(object sender, EventArgs e)
+        {
+            try
+            {
+                flashlightToggleInProgress = !flashlightToggleInProgress;
+                if (flashlightToggleInProgress)
+                {
+                    Microsoft.Maui.Devices.Flashlight.Default.TurnOnAsync();
+                }
+                else
+                {
+                    Microsoft.Maui.Devices.Flashlight.Default.TurnOffAsync();
+                }
+            }
+            catch { }
+        }
+
+        private void OnExploreSafeZonesClicked(object sender, EventArgs e)
+        {
+            if (Shell.Current != null)
+            {
+                Shell.Current.GoToAsync("//MapPage");
+            }
+        }
+
+        private void OnEndNavigationClicked(object sender, EventArgs e)
+        {
+            if (turnGuidancePanel != null) turnGuidancePanel.IsVisible = false;
+            if (endNavigationButton != null) endNavigationButton.IsVisible = false;
+            if (exploreSafeZonesButton != null) exploreSafeZonesButton.IsVisible = true;
+        }
+
+        private void OnFloodSimulationConfigureClicked(object sender, EventArgs e)
+        {
+            if (floodSimulationConfigurationSheet != null)
+            {
+                floodSimulationConfigurationSheet.IsVisible = true;
+            }
+        }
+
+        private void OnFloodSimulationSheetCloseClicked(object sender, EventArgs e)
+        {
+            if (floodSimulationConfigurationSheet != null)
+            {
+                floodSimulationConfigurationSheet.IsVisible = false;
+            }
+        }
+
+        private void OnFloodSimulationSliderChanged(object sender, ValueChangedEventArgs e)
+        {
+            if (floodVisualizationPrimaryLabel != null)
+            {
+                floodVisualizationPrimaryLabel.Text = $"Simulating {e.NewValue:F2} meters of flood depth near you";
+            }
+        }
+
+        private void OnDeveloperSafeZoneTestClicked(object sender, EventArgs e) { }
+        private void OnDeveloperTurnTestClicked(object sender, EventArgs e) { }
+        private void OnDeveloperRerouteTestClicked(object sender, EventArgs e) { }
+        private void OnDeveloperHazardRerouteTestClicked(object sender, EventArgs e) { }
+
+        private void Initialize2DCameraMap()
+        {
+            try
+            {
+                if (CameraMapControl != null && CameraMapControl.Map == null)
+                {
+                    var map = new Mapsui.Map();
+                    map.Layers.Add(Mapsui.Tiling.OpenStreetMap.CreateTileLayer());
+                    CameraMapControl.Map = map;
+                }
+            }
+            catch { }
+        }
+
+        #endregion
     }
 }

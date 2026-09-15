@@ -133,30 +133,15 @@
                 HorizontalOptions="Fill"
                 VerticalOptions="Fill" />
 
-            <!-- 2D Map submodule belongs elsewhere; no fake map is shown. -->
+            <!-- 2D Map submodule: Full OSM & GeoJSON 2D Evacuation Map -->
             <Grid
                 x:Name="mapModeLayer"
                 IsVisible="False"
                 ZIndex="6"
                 BackgroundColor="#F4F5F6">
-                <VerticalStackLayout
-                    HorizontalOptions="Center"
-                    VerticalOptions="Center"
-                    Spacing="6"
-                    Margin="32">
-                    <Label
-                        Text="2D Map Guidance"
-                        TextColor="#1A1A1A"
-                        FontSize="21"
-                        FontAttributes="Bold"
-                        HorizontalTextAlignment="Center" />
-                    <Label
-                        x:Name="mapModeStatusLabel"
-                        Text="Placeholder"
-                        TextColor="#777777"
-                        FontSize="14"
-                        HorizontalTextAlignment="Center" />
-                </VerticalStackLayout>
+                <mapsui:MapControl x:Name="CameraMapControl" 
+                                   HorizontalOptions="FillAndExpand" 
+                                   VerticalOptions="FillAndExpand" />
             </Grid>
 
             <!-- ========================================================= -->
