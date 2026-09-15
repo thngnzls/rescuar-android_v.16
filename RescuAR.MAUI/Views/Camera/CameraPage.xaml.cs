@@ -835,8 +835,7 @@ namespace RescuAR.App.Views.Camera
             cameraModeSwitcherButton.IsVisible =
                 !safeZoneConfirmed;
 
-            mapModeStatusLabel.Text =
-                "Placeholder";
+            // mapModeStatusLabel is replaced by CameraMapControl in 2D Map mode
 
             if (floodMode &&
                 currentFloodVisualization.IsAvailable)
@@ -8908,50 +8907,6 @@ namespace RescuAR.App.Views.Camera
             }
             catch { }
         }
-
-        private void OnExploreSafeZonesClicked(object sender, EventArgs e)
-        {
-            if (Shell.Current != null)
-            {
-                Shell.Current.GoToAsync("//MapPage");
-            }
-        }
-
-        private void OnEndNavigationClicked(object sender, EventArgs e)
-        {
-            if (turnGuidancePanel != null) turnGuidancePanel.IsVisible = false;
-            if (endNavigationButton != null) endNavigationButton.IsVisible = false;
-            if (exploreSafeZonesButton != null) exploreSafeZonesButton.IsVisible = true;
-        }
-
-        private void OnFloodSimulationConfigureClicked(object sender, EventArgs e)
-        {
-            if (floodSimulationConfigurationSheet != null)
-            {
-                floodSimulationConfigurationSheet.IsVisible = true;
-            }
-        }
-
-        private void OnFloodSimulationSheetCloseClicked(object sender, EventArgs e)
-        {
-            if (floodSimulationConfigurationSheet != null)
-            {
-                floodSimulationConfigurationSheet.IsVisible = false;
-            }
-        }
-
-        private void OnFloodSimulationSliderChanged(object sender, ValueChangedEventArgs e)
-        {
-            if (floodVisualizationPrimaryLabel != null)
-            {
-                floodVisualizationPrimaryLabel.Text = $"Simulating {e.NewValue:F2} meters of flood depth near you";
-            }
-        }
-
-        private void OnDeveloperSafeZoneTestClicked(object sender, EventArgs e) { }
-        private void OnDeveloperTurnTestClicked(object sender, EventArgs e) { }
-        private void OnDeveloperRerouteTestClicked(object sender, EventArgs e) { }
-        private void OnDeveloperHazardRerouteTestClicked(object sender, EventArgs e) { }
 
         private void Initialize2DCameraMap()
         {
