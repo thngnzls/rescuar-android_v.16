@@ -116,7 +116,7 @@
 		rebuilt first only when BuildNativeBridgeOnBuild=true is supplied.
 	-->
 	<ItemGroup Condition="'$(TargetFramework)' == 'net9.0-android'">
-		<AndroidNativeLibrary Include="Platforms\Android\lib\arm64-v8a\libnative_bridge.so" Abi="arm64-v8a" />
+		<AndroidNativeLibrary Include="Platforms\Android\lib\arm64-v8a\libnative_bridge.so" Abi="arm64-v8a" Condition="Exists('Platforms\Android\lib\arm64-v8a\libnative_bridge.so')" />
 	</ItemGroup>
 	<ItemGroup>
 	  <Folder Include="Platforms\Android\Vulkan\Shaders\" />
