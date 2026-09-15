@@ -27,11 +27,7 @@ public partial class CommunityReportsOverviewViewModel : ObservableObject
     private string _actionText = string.Empty;
 
     [ObservableProperty]
-<<<<<<< HEAD:RescuAR.App/ViewModels/Dashboard/CommunityReportsOverviewViewModel.cs
-    public partial string ModuleRoute { get; set; } = "//Reports";
-=======
     private string _moduleRoute = "//Reports";
->>>>>>> upstream/dev:RescuAR.MAUI/ViewModels/Dashboard/CommunityReportsOverviewViewModel.cs
 
     [ObservableProperty]
     private string _moduleName = string.Empty;

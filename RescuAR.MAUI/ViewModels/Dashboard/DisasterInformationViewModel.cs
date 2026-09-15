@@ -21,12 +21,7 @@ public partial class DisasterInformationViewModel : ObservableObject
     [ObservableProperty]
     private string _actionText = string.Empty;
 
-    [ObservableProperty]
-<<<<<<< HEAD:RescuAR.App/ViewModels/Dashboard/DisasterInformationViewModel.cs
-    public partial string ModuleRoute { get; set; } = "AdvisoryFeedPage";
-=======
     private string _moduleRoute = "AdvisoryFeedPage";
->>>>>>> upstream/dev:RescuAR.MAUI/ViewModels/Dashboard/DisasterInformationViewModel.cs
 
     [ObservableProperty]
     private string _moduleName = string.Empty;
