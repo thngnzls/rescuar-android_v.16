@@ -9,69 +9,94 @@
     NavigationPage.HasNavigationBar="False">
 
     <ContentPage.Background>
-        <LinearGradientBrush StartPoint="0,0" EndPoint="0,1">
-            <GradientStop Color="#F8FAFC" Offset="0.0" />
-            <GradientStop Color="#FFFFFF" Offset="0.6" />
-            <GradientStop Color="#F1F5F9" Offset="1.0" />
+        <LinearGradientBrush StartPoint="0,0" EndPoint="1,1">
+            <GradientStop Color="#0F172A" Offset="0.0" />
+            <GradientStop Color="#0A2540" Offset="0.5" />
+            <GradientStop Color="#0D9488" Offset="1.0" />
         </LinearGradientBrush>
     </ContentPage.Background>
 
     <Grid RowDefinitions="*, Auto" ColumnDefinitions="*">
         
-        <!-- Center Content: Professional Logo Icon Container -->
+        <!-- Center Content: Logo, Title, and Subtitle -->
         <VerticalStackLayout Grid.Row="0" 
                              HorizontalOptions="Center" 
                              VerticalOptions="Center"
-                             Spacing="0"
-                             Padding="24">
+                             Spacing="24"
+                             Padding="32">
             
-            <!-- Glassmorphic Elevated Logo Box -->
-            <Border WidthRequest="168"
-                    HeightRequest="168"
-                    StrokeThickness="1"
-                    Stroke="#E2E8F0"
-                    BackgroundColor="White"
+            <!-- Glassmorphic Elevated Logo Box with Teal Glow -->
+            <Border WidthRequest="150"
+                    HeightRequest="150"
+                    StrokeThickness="1.5"
+                    Stroke="#33E2E8F0"
+                    BackgroundColor="#1E293B"
                     StrokeShape="RoundRectangle 36"
                     HorizontalOptions="Center"
                     VerticalOptions="Center">
                 <Border.Shadow>
-                    <Shadow Brush="#00848E" Offset="0,12" Radius="36" Opacity="0.12" />
+                    <Shadow Brush="#0D9488" Offset="0,16" Radius="32" Opacity="0.4" />
                 </Border.Shadow>
                 
-                <Image Source="rescuar_logo.jpg"
-                       Aspect="AspectFill"
-                       HorizontalOptions="Fill"
-                       VerticalOptions="Fill"
-                       Margin="0" />
+                <Grid>
+                    <Image Source="rescuar_logo.jpg"
+                           Aspect="AspectFill"
+                           HorizontalOptions="Fill"
+                           VerticalOptions="Fill" />
+                </Grid>
             </Border>
+            
+            <!-- App Title & Tagline -->
+            <VerticalStackLayout Spacing="6" HorizontalOptions="Center">
+                <Label Text="RescuAR"
+                       FontSize="34"
+                       FontAttributes="Bold"
+                       TextColor="#FFFFFF"
+                       CharacterSpacing="1"
+                       HorizontalTextAlignment="Center" />
+
+                <Label Text="EVACUATION GUIDANCE SYSTEM"
+                       FontSize="11"
+                       FontAttributes="Bold"
+                       TextColor="#94A3B8"
+                       CharacterSpacing="2.5"
+                       HorizontalTextAlignment="Center" />
+            </VerticalStackLayout>
             
         </VerticalStackLayout>
 
-        <!-- Bottom Loading State & Version -->
+        <!-- Bottom Loading Indicator & System Telemetry Info -->
         <VerticalStackLayout Grid.Row="1"
                              HorizontalOptions="Center"
                              VerticalOptions="End"
-                             Margin="0,0,0,56"
-                             Spacing="14">
-            
-            <ActivityIndicator IsRunning="True"
-                               Color="#00848E"
-                               WidthRequest="28"
-                               HeightRequest="28"
-                               HorizontalOptions="Center" />
-            
-            <Label Text="{Binding StatusText}"
-                   FontSize="13"
-                   FontFamily="OpenSansSemibold"
-                   TextColor="#475569"
-                   CharacterSpacing="0.3"
-                   HorizontalOptions="Center" />
-            
+                             Margin="0,0,0,52"
+                             Spacing="12">
+
+            <Border StrokeThickness="1"
+                    Stroke="#22FFFFFF"
+                    BackgroundColor="#1F2937"
+                    StrokeShape="RoundRectangle 20"
+                    Padding="16,8"
+                    HorizontalOptions="Center">
+                <HorizontalStackLayout Spacing="10" VerticalOptions="Center">
+                    <ActivityIndicator IsRunning="True"
+                                       Color="#14B8A6"
+                                       WidthRequest="20"
+                                       HeightRequest="20"
+                                       VerticalOptions="Center" />
+                    <Label Text="{Binding StatusText}"
+                           FontSize="12"
+                           FontAttributes="Bold"
+                           TextColor="#E2E8F0"
+                           CharacterSpacing="0.5"
+                           VerticalOptions="Center" />
+                </HorizontalStackLayout>
+            </Border>
+
             <Label Text="{Binding VersionText}"
                    FontSize="11"
-                   FontFamily="OpenSansRegular"
-                   TextColor="#94A3B8"
-                   CharacterSpacing="0.8"
+                   TextColor="#64748B"
+                   CharacterSpacing="1"
                    HorizontalOptions="Center" />
             
         </VerticalStackLayout>
