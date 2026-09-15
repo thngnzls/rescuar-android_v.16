@@ -21,6 +21,7 @@ public partial class DisasterInformationViewModel : ObservableObject
     [ObservableProperty]
     private string _actionText = string.Empty;
 
+    [ObservableProperty]
     private string _moduleRoute = "AdvisoryFeedPage";
 
     [ObservableProperty]
