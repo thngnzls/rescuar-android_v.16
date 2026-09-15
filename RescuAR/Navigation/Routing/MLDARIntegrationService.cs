@@ -1,0 +1,585 @@
+using RescuAR.AR;
+using RescuAR.Diagnostics;
+using RescuAR.Navigation.Models;
+using RescuAR.Navigation.Progress;
+using RescuAR.Navigation.Projection;
+using System;
+using System.Collections.Generic;
+using System.Threading;
+using System.Threading.Tasks;
+
+namespace RescuAR.Navigation.Routing;
+
+/// <summary>
+/// Connects the selected routing provider (online MLD or offline A*) to the AR route bridge.
+///
+/// The full RouteResult is returned to the caller. Camera/navigation may then
+/// keep that full geometry and republish short progress-aware AR windows
+/// without making another Railway request for every GPS update.
+/// </summary>
+public sealed class MLDARIntegrationService
+{
+    private const string LogTag =
+        "RescuAR-Routing";
+
+    private const string ProgressLogTag =
+        "RescuAR-NavProgress";
+
+    private readonly IRoutingService routingService;
+
+    public MLDARIntegrationService()
+        : this(
+            new MLDRoutingService())
+    {
+    }
+
+    public MLDARIntegrationService(
+        IRoutingService routingService)
+    {
+        this.routingService =
+            routingService ??
+            throw new ArgumentNullException(
+                nameof(routingService));
+    }
+
+    public async Task<RouteResult?> RequestAndPublishAsync(
+        GeoCoordinate origin,
+        GeoCoordinate destination,
+        double mapToArYawDegrees,
+        double arWindowMeters = 7.5,
+        CancellationToken cancellationToken = default)
+    {
+        AndroidLog.Debug(
+            LogTag,
+            "Routing -> AR integration request: " +
+            $"provider='{routingService.AlgorithmName}', " +
+            $"window={arWindowMeters:F1} m, " +
+            $"mapToArYaw={mapToArYawDegrees:F2} deg");
+
+        RouteResult? route =
+            await routingService.FindRouteAsync(
+                origin,
+                destination,
+                cancellationToken);
+
+        if (route is null ||
+            route.Points.Count <
+                2)
+        {
+            AndroidLog.Warn(
+                LogTag,
+                "Routing -> AR integration produced no usable route; " +
+                "clearing AR route.");
+
+            ARRouteBridge.Clear();
+
+            return route;
+        }
+
+        GeoCoordinate initialReference =
+            route.Points[0]
+                .Coordinate;
+
+        bool published =
+            PublishWindow(
+                route,
+                route.Points[0]
+                    .DistanceFromStartMeters,
+                initialReference,
+                mapToArYawDegrees,
+                arOriginOffsetX:
+                    0.0f,
+                arOriginOffsetZ:
+                    0.0f,
+                arWindowMeters:
+                    arWindowMeters,
+                sourceSegmentIndex:
+                    0,
+                logTag:
+                    ProgressLogTag,
+                clearRouteOnFailure:
+                    true);
+
+        if (published)
+        {
+            AndroidLog.Debug(
+                LogTag,
+                "Routing -> AR route published successfully: " +
+                $"algorithm='{route.Algorithm}'.");
+        }
+
+        return route;
+    }
+
+    /// <summary>
+    /// Requests route geometry without touching ARRouteBridge.
+    ///
+    /// Dynamic rerouting uses this two-phase path so the currently visible
+    /// route remains intact until a replacement route has been received
+    /// and is ready to publish.
+    /// </summary>
+    public Task<RouteResult?> RequestRouteAsync(
+        GeoCoordinate origin,
+        GeoCoordinate destination,
+        CancellationToken cancellationToken = default)
+    {
+        AndroidLog.Debug(
+            LogTag,
+            "Route-only request started: " +
+            $"provider='{routingService.AlgorithmName}'.");
+
+        return routingService.FindRouteAsync(
+            origin,
+            destination,
+            cancellationToken);
+    }
+
+    /// <summary>
+    /// Republishes a short AR window from the retained full route.
+    ///
+    /// arOriginOffsetX/Z are expressed relative to the existing AR route root
+    /// / ground anchor. CameraPage supplies the current AR camera horizontal
+    /// offset from that anchor so the new window begins near the user's
+    /// current physical position rather than staying at the original route
+    /// start.
+    /// </summary>
+    public bool PublishProgressWindow(
+        RouteResult route,
+        double progressMeters,
+        GeoCoordinate snappedReference,
+        double mapToArYawDegrees,
+        float arOriginOffsetX,
+        float arOriginOffsetZ,
+        double arWindowMeters = 7.5,
+        bool clearRouteOnFailure = true,
+        int sourceSegmentIndex = -1)
+    {
+        ArgumentNullException.ThrowIfNull(
+            route);
+
+        bool published =
+            PublishWindow(
+                route,
+                progressMeters,
+                snappedReference,
+                mapToArYawDegrees,
+                arOriginOffsetX,
+                arOriginOffsetZ,
+                arWindowMeters,
+                ResolveSourceSegmentIndex(
+                    route,
+                    progressMeters,
+                    sourceSegmentIndex),
+                ProgressLogTag,
+                clearRouteOnFailure);
+
+        if (published)
+        {
+            AndroidLog.Debug(
+                ProgressLogTag,
+                "Moving AR route window published: " +
+                $"progress={progressMeters:F1} m, " +
+                $"sourceSegment=" +
+                $"{ResolveSourceSegmentIndex(route, progressMeters, sourceSegmentIndex)}, " +
+                $"window={arWindowMeters:F1} m, " +
+                $"arOriginOffset=({arOriginOffsetX:F2}," +
+                $"{arOriginOffsetZ:F2}) m");
+        }
+
+        return published;
+    }
+
+    /// <summary>
+    /// Publishes a direct local access connector from the user's current GPS
+    /// position to the route-matched pedestrian corridor coordinate.
+    ///
+    /// This is intentionally different from PublishProgressWindow(...): while
+    /// the user is not yet verified inside the routed pedestrian corridor, the
+    /// cyan visual should point TO the nearest route instead of pretending the
+    /// camera is already inside that route corridor.
+    /// </summary>
+    public bool PublishApproachToRoute(
+        RouteResult route,
+        GeoCoordinate userCoordinate,
+        GeoCoordinate snappedRouteCoordinate,
+        double mapToArYawDegrees,
+        float arOriginOffsetX,
+        float arOriginOffsetZ,
+        bool clearRouteOnFailure = true)
+    {
+        ArgumentNullException.ThrowIfNull(
+            route);
+
+        if (!ValidateLocalRouteOriginOffset(
+                arOriginOffsetX,
+                arOriginOffsetZ,
+                ProgressLogTag,
+                clearRouteOnFailure))
+        {
+            return false;
+        }
+
+        if (!userCoordinate.IsValid ||
+            !snappedRouteCoordinate.IsValid)
+        {
+            AndroidLog.Warn(
+                ProgressLogTag,
+                "Approach-to-route connector rejected because GPS or snapped route coordinate is invalid.");
+
+            return false;
+        }
+
+        double connectorDistanceMeters =
+            userCoordinate.DistanceTo(
+                snappedRouteCoordinate);
+
+        if (!double.IsFinite(
+                connectorDistanceMeters) ||
+            connectorDistanceMeters <=
+                0.05)
+        {
+            return false;
+        }
+
+        if (connectorDistanceMeters >
+            RouteCorridorPolicy.MaximumRecoveryConnectorMeters)
+        {
+            AndroidLog.Warn(
+                ProgressLogTag,
+                "Approach-to-route connector rejected because it exceeds " +
+                "the bounded local recovery distance: " +
+                $"distance={connectorDistanceMeters:F1} m, " +
+                $"maximum={RouteCorridorPolicy.MaximumRecoveryConnectorMeters:F1} m.");
+
+            return false;
+        }
+
+        const double earthRadiusMeters =
+            6371008.8;
+
+        double referenceLatitudeRadians =
+            userCoordinate.Latitude *
+            Math.PI /
+            180.0;
+
+        double deltaLatitudeRadians =
+            (snappedRouteCoordinate.Latitude -
+             userCoordinate.Latitude) *
+            Math.PI /
+            180.0;
+
+        double deltaLongitudeRadians =
+            (snappedRouteCoordinate.Longitude -
+             userCoordinate.Longitude) *
+            Math.PI /
+            180.0;
+
+        double northMeters =
+            deltaLatitudeRadians *
+            earthRadiusMeters;
+
+        double eastMeters =
+            deltaLongitudeRadians *
+            earthRadiusMeters *
+            Math.Cos(
+                referenceLatitudeRadians);
+
+        LocalRoutePoint[] connector =
+        [
+            new LocalRoutePoint(
+                userCoordinate,
+                0.0,
+                0.0,
+                0.0),
+            new LocalRoutePoint(
+                snappedRouteCoordinate,
+                eastMeters,
+                northMeters,
+                connectorDistanceMeters)
+        ];
+
+        IReadOnlyList<ArHorizontalRoutePoint> aligned =
+            ArRouteAlignment.Rotate(
+                connector,
+                mapToArYawDegrees);
+
+        if (aligned.Count <
+            2)
+        {
+            if (clearRouteOnFailure)
+            {
+                ARRouteBridge.Clear();
+            }
+
+            return false;
+        }
+
+        ArHorizontalRoutePoint[] shifted =
+            new ArHorizontalRoutePoint[
+                aligned.Count];
+
+        for (int i = 0;
+             i < aligned.Count;
+             i++)
+        {
+            ArHorizontalRoutePoint point =
+                aligned[i];
+
+            shifted[i] =
+                new ArHorizontalRoutePoint(
+                    point.X +
+                        arOriginOffsetX,
+                    point.Z +
+                        arOriginOffsetZ,
+                    point.DistanceFromWindowStartMeters);
+        }
+
+        ARRouteBridge.Publish(
+            shifted,
+            route.Algorithm,
+            route.TotalDistanceMeters,
+            RouteVisualKind.ApproachConnector);
+
+        AndroidLog.Debug(
+            ProgressLogTag,
+            "Approach-to-route AR connector published: " +
+            $"distance={connectorDistanceMeters:F1} m, " +
+            $"user=({userCoordinate.Latitude:F7},{userCoordinate.Longitude:F7}), " +
+            $"route=({snappedRouteCoordinate.Latitude:F7},{snappedRouteCoordinate.Longitude:F7}), " +
+            $"arOriginOffset=({arOriginOffsetX:F2},{arOriginOffsetZ:F2}) m");
+
+        return true;
+    }
+
+    public void ClearRoute()
+    {
+        AndroidLog.Debug(
+            LogTag,
+            "Routing -> AR route clear requested.");
+
+        ARRouteBridge.Clear();
+    }
+
+    private static bool PublishWindow(
+        RouteResult route,
+        double startDistanceMeters,
+        GeoCoordinate reference,
+        double mapToArYawDegrees,
+        float arOriginOffsetX,
+        float arOriginOffsetZ,
+        double arWindowMeters,
+        int sourceSegmentIndex,
+        string logTag,
+        bool clearRouteOnFailure)
+    {
+        if (!ValidateLocalRouteOriginOffset(
+                arOriginOffsetX,
+                arOriginOffsetZ,
+                logTag,
+                clearRouteOnFailure))
+        {
+            return false;
+        }
+
+        if (!double.IsFinite(
+                arWindowMeters) ||
+            arWindowMeters <=
+                0.0)
+        {
+            AndroidLog.Warn(
+                logTag,
+                $"AR route publication rejected an invalid local window: " +
+                $"{arWindowMeters} m.");
+
+            if (clearRouteOnFailure)
+            {
+                ARRouteBridge.Clear();
+            }
+
+            return false;
+        }
+
+        double boundedWindowMeters =
+            Math.Min(
+                arWindowMeters,
+                LocalArNavigationPolicy.MaximumVisibleWindowMeters);
+
+        if (boundedWindowMeters <
+            arWindowMeters)
+        {
+            AndroidLog.Warn(
+                logTag,
+                "AR route window was capped by the moving-local-frame policy: " +
+                $"requested={arWindowMeters:F1} m, " +
+                $"applied={boundedWindowMeters:F1} m.");
+        }
+
+        IReadOnlyList<LocalRoutePoint> localPoints =
+            LocalRouteProjector.ProjectWindow(
+                route,
+                startDistanceMeters,
+                reference,
+                boundedWindowMeters);
+
+        AndroidLog.Debug(
+            logTag,
+            "Local route window projected: " +
+            $"sourcePoints={route.Points.Count}, " +
+            $"windowPoints={localPoints.Count}, " +
+            $"window={boundedWindowMeters:F1} m, " +
+            $"startDistance={startDistanceMeters:F1} m, " +
+            $"reference=({reference.Latitude:F7}," +
+            $"{reference.Longitude:F7})");
+
+        if (localPoints.Count <
+            2)
+        {
+            AndroidLog.Warn(
+                logTag,
+                "Local route window has fewer than two points. " +
+                "The user may be at the end of the geometry.");
+
+            if (clearRouteOnFailure)
+            {
+                ARRouteBridge.Clear();
+            }
+            else
+            {
+                AndroidLog.Warn(
+                    logTag,
+                    "Replacement route window was not publishable; retaining existing AR route.");
+            }
+
+            return false;
+        }
+
+        IReadOnlyList<ArHorizontalRoutePoint> aligned =
+            ArRouteAlignment.Rotate(
+                localPoints,
+                mapToArYawDegrees);
+
+        if (aligned.Count <
+            2)
+        {
+            if (clearRouteOnFailure)
+            {
+                ARRouteBridge.Clear();
+            }
+            else
+            {
+                AndroidLog.Warn(
+                    logTag,
+                    "Replacement route window was not publishable; retaining existing AR route.");
+            }
+
+            return false;
+        }
+
+        ArHorizontalRoutePoint[] shifted =
+            new ArHorizontalRoutePoint[
+                aligned.Count];
+
+        for (int i = 0;
+             i < aligned.Count;
+             i++)
+        {
+            ArHorizontalRoutePoint point =
+                aligned[i];
+
+            shifted[i] =
+                new ArHorizontalRoutePoint(
+                    point.X +
+                        arOriginOffsetX,
+                    point.Z +
+                        arOriginOffsetZ,
+                    point.DistanceFromWindowStartMeters);
+        }
+
+        AndroidLog.Debug(
+            logTag,
+            "AR route alignment completed: " +
+            $"arPoints={shifted.Length}, " +
+            $"mapToArYaw={mapToArYawDegrees:F2} deg");
+
+        ARRouteBridge.Publish(
+            shifted,
+            route.Algorithm,
+            route.TotalDistanceMeters,
+            RouteVisualKind.RouteWindow,
+            startDistanceMeters,
+            sourceSegmentIndex);
+
+        return true;
+    }
+
+    private static int ResolveSourceSegmentIndex(
+        RouteResult route,
+        double progressMeters,
+        int requestedSegmentIndex)
+    {
+        int maximumSegmentIndex =
+            route.Points.Count -
+            2;
+
+        if (maximumSegmentIndex <
+            0)
+        {
+            return -1;
+        }
+
+        if (requestedSegmentIndex >=
+                0 &&
+            requestedSegmentIndex <=
+                maximumSegmentIndex)
+        {
+            return requestedSegmentIndex;
+        }
+
+        for (int i = 0;
+             i <=
+                maximumSegmentIndex;
+             i++)
+        {
+            if (progressMeters <=
+                route.Points[i + 1]
+                    .DistanceFromStartMeters)
+            {
+                return i;
+            }
+        }
+
+        return maximumSegmentIndex;
+    }
+
+    private static bool ValidateLocalRouteOriginOffset(
+        float arOriginOffsetX,
+        float arOriginOffsetZ,
+        string logTag,
+        bool clearRouteOnFailure)
+    {
+        if (LocalArNavigationPolicy.IsRouteOriginOffsetAcceptable(
+                arOriginOffsetX,
+                arOriginOffsetZ,
+                out float offsetDistanceMeters))
+        {
+            return true;
+        }
+
+        AndroidLog.Warn(
+            logTag,
+            "AR route publication blocked by the moving-local-frame guard: " +
+            $"originOffset=({arOriginOffsetX:F2},{arOriginOffsetZ:F2}) m, " +
+            $"horizontalDistance={offsetDistanceMeters:F2} m, " +
+            $"maximum=" +
+            $"{LocalArNavigationPolicy.MaximumRouteOriginOffsetMeters:F1} m. " +
+            "Waiting for a nearby ground-anchor replacement instead of " +
+            "publishing a city-scale local offset.");
+
+        if (clearRouteOnFailure)
+        {
+            ARRouteBridge.Clear();
+        }
+
+        return false;
+    }
+}
