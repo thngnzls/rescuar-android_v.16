@@ -41,6 +41,8 @@ public static class ARFloodDepthRenderer
 
     private static Entity? activeRoot;
 
+    private static long boundGraphicsGeneration;
+
     private static long appliedVersion =
         -1;
 
@@ -91,6 +93,8 @@ public static class ARFloodDepthRenderer
         lock (sync)
         {
             activeRoot = root;
+            boundGraphicsGeneration =
+                ARRenderGenerationBridge.Current.GraphicsGeneration;
             appliedVersion = -1;
             appliedDepthMeters = 0.0f;
         }
@@ -120,7 +124,9 @@ public static class ARFloodDepthRenderer
         {
             if (!ReferenceEquals(
                     activeRoot,
-                    floodRoot))
+                    floodRoot) ||
+                !ARRenderGenerationBridge.IsCurrentGraphics(
+                    boundGraphicsGeneration))
             {
                 return false;
             }
@@ -128,6 +134,19 @@ public static class ARFloodDepthRenderer
 
         ARFloodDepthBridge.FloodDepthSnapshot snapshot =
             ARFloodDepthBridge.Current;
+
+        if (!ARRenderGenerationBridge.IsCurrent(
+                snapshot.Generation) ||
+            !snapshot.ModeActive ||
+            snapshot.GroundTrust == ARGroundTrust.None ||
+            snapshot.GroundReferenceGeneration <= 0)
+        {
+            floodRoot.IsEnabled = false;
+            appliedDepthMeters = 0.0f;
+            ARFloodDepthBridge.AcknowledgeDrawThreadVersion(
+                snapshot.Version);
+            return false;
+        }
 
         if (snapshot.Version == appliedVersion)
         {
@@ -140,6 +159,7 @@ public static class ARFloodDepthRenderer
             snapshot.Version;
 
         if (!snapshot.IsAvailable ||
+            !snapshot.Metadata.IsValid ||
             !float.IsFinite(snapshot.LocalDepthMeters) ||
             snapshot.LocalDepthMeters <
                 MinimumRenderableDepthMeters)
@@ -152,6 +172,9 @@ public static class ARFloodDepthRenderer
                 "AR flood-depth V7 renderer cleared/disabled: " +
                 $"version={snapshot.Version}; " +
                 "no Evergine water mesh is rendered.");
+
+            ARFloodDepthBridge.AcknowledgeDrawThreadVersion(
+                snapshot.Version);
 
             return false;
         }
@@ -167,10 +190,37 @@ public static class ARFloodDepthRenderer
             "AR FLOOD DEPTH V7 STATE APPLIED: " +
             $"version={snapshot.Version}, " +
             $"depth={appliedDepthMeters:F2} m, " +
+            $"groundTrust={snapshot.GroundTrust}, " +
+            $"groundReferenceGeneration={snapshot.GroundReferenceGeneration}, " +
             "mode=ARCORE_DEPTH_OCCLUSION, " +
             "evergineFloodMesh=False, " +
             $"source='{snapshot.Source}'.");
 
+        ARFloodDepthBridge.AcknowledgeDrawThreadVersion(
+            snapshot.Version);
+
         return true;
+    }
+
+    public static void TeardownGraphicsGeneration(
+        long graphicsGeneration)
+    {
+        lock (sync)
+        {
+            if (boundGraphicsGeneration != graphicsGeneration)
+            {
+                return;
+            }
+
+            if (activeRoot is not null)
+            {
+                activeRoot.IsEnabled = false;
+            }
+
+            activeRoot = null;
+            boundGraphicsGeneration = 0;
+            appliedVersion = -1;
+            appliedDepthMeters = 0.0f;
+        }
     }
 }

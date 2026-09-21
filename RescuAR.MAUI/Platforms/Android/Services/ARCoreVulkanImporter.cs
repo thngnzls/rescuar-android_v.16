@@ -49,6 +49,8 @@ public unsafe sealed class ARCoreVulkanImporter : IDisposable
     private readonly VKGraphicsContext graphicsContext;
     private readonly ResourceFactory resourceFactory;
     private readonly VulkanExternalFrameImporter externalFrameImporter;
+    private readonly int drawThreadId;
+    private readonly float[] lastLoggedCameraUv = new float[8];
 
     private VulkanYcbcrResources? ycbcrResources;
     private VulkanExternalFrame? externalFrame;
@@ -65,6 +67,7 @@ public unsafe sealed class ARCoreVulkanImporter : IDisposable
 
     private bool imported;
     private bool disposed;
+    private bool hasLoggedCameraUv;
 
     private bool vulkanDeviceLost;
 
@@ -77,6 +80,9 @@ public unsafe sealed class ARCoreVulkanImporter : IDisposable
             graphicsContext
             ?? throw new ArgumentNullException(
                 nameof(graphicsContext));
+
+        drawThreadId =
+            Environment.CurrentManagedThreadId;
 
         resourceFactory =
             ResolveResourceFactory(
@@ -152,6 +158,7 @@ public unsafe sealed class ARCoreVulkanImporter : IDisposable
         uint outputWidth,
         uint outputHeight)
     {
+        ThrowIfNotDrawThread();
         ThrowIfDisposed();
 
         if (vulkanDeviceLost)
@@ -404,7 +411,7 @@ public unsafe sealed class ARCoreVulkanImporter : IDisposable
                 "ARCore camera pipeline initialized. " +
                 "First external YCbCr frame converted to RGBA.");
 
-            LogCameraUv(
+            LogCameraUvIfChanged(
                 cameraUv);
 
             LogPersistentHandles();
@@ -516,6 +523,9 @@ public unsafe sealed class ARCoreVulkanImporter : IDisposable
             imported =
                 true;
 
+            LogCameraUvIfChanged(
+                cameraUv);
+
             return currentTexture;
         }
         catch
@@ -569,8 +579,11 @@ public unsafe sealed class ARCoreVulkanImporter : IDisposable
             return true;
         }
 
-        if (query.FormatProperties.externalFormat !=
-            ycbcrResources.ExternalFormat)
+        VkAndroidHardwareBufferFormatPropertiesANDROID formatProperties =
+            query.FormatProperties;
+
+        if (!ycbcrResources.IsCompatible(
+                ref formatProperties))
         {
             return true;
         }
@@ -595,7 +608,7 @@ public unsafe sealed class ARCoreVulkanImporter : IDisposable
         return false;
     }
 
-    private static void LogCameraUv(
+    private void LogCameraUvIfChanged(
         float[] cameraUv)
     {
         if (cameraUv.Length != 8)
@@ -603,25 +616,39 @@ public unsafe sealed class ARCoreVulkanImporter : IDisposable
             return;
         }
 
-        Log.Debug(
-            Tag,
-            "Camera UV mapping:");
+        bool changed =
+            !hasLoggedCameraUv;
 
-        Log.Debug(
-            Tag,
-            $"TopLeft = ({cameraUv[0]:F6}, {cameraUv[1]:F6})");
+        for (int index = 0;
+             index < cameraUv.Length && !changed;
+             index++)
+        {
+            changed =
+                MathF.Abs(
+                    lastLoggedCameraUv[index] - cameraUv[index]) >
+                0.000001f;
+        }
 
-        Log.Debug(
-            Tag,
-            $"TopRight = ({cameraUv[2]:F6}, {cameraUv[3]:F6})");
+        if (!changed)
+        {
+            return;
+        }
 
-        Log.Debug(
-            Tag,
-            $"BottomLeft = ({cameraUv[4]:F6}, {cameraUv[5]:F6})");
+        Array.Copy(
+            cameraUv,
+            lastLoggedCameraUv,
+            cameraUv.Length);
 
-        Log.Debug(
+        hasLoggedCameraUv =
+            true;
+
+        Log.Info(
             Tag,
-            $"BottomRight = ({cameraUv[6]:F6}, {cameraUv[7]:F6})");
+            "ARCORE_CAMERA_UV_TRANSFORM " +
+            $"topLeft=({cameraUv[0]:F6},{cameraUv[1]:F6}); " +
+            $"topRight=({cameraUv[2]:F6},{cameraUv[3]:F6}); " +
+            $"bottomLeft=({cameraUv[4]:F6},{cameraUv[5]:F6}); " +
+            $"bottomRight=({cameraUv[6]:F6},{cameraUv[7]:F6}).");
     }
 
     private void LogPersistentHandles()
@@ -1079,8 +1106,58 @@ public unsafe sealed class ARCoreVulkanImporter : IDisposable
         }
     }
 
+    private void ThrowIfNotDrawThread()
+    {
+        if (Environment.CurrentManagedThreadId != drawThreadId)
+        {
+            throw new InvalidOperationException(
+                "ARCore Vulkan importer access must remain on its owning " +
+                "Evergine draw thread.");
+        }
+    }
+
+    public void QuiesceAndDisposeOnDrawThread()
+    {
+        ThrowIfNotDrawThread();
+
+        if (disposed)
+        {
+            return;
+        }
+
+        WaitForGraphicsDeviceIdle(graphicsContext);
+
+        Dispose();
+    }
+
+    public static void WaitForGraphicsDeviceIdle(
+        VKGraphicsContext graphicsContext)
+    {
+        ArgumentNullException.ThrowIfNull(graphicsContext);
+
+        VkDevice device =
+            graphicsContext.VkDevice;
+
+        if (device.Handle == 0)
+        {
+            return;
+        }
+
+        VkResult idleResult =
+            VulkanNative.vkDeviceWaitIdle(device);
+
+        if (idleResult != VkResult.VK_SUCCESS)
+        {
+            throw new InvalidOperationException(
+                $"vkDeviceWaitIdle failed with {idleResult} during " +
+                "ARCore graphics teardown.");
+        }
+    }
+
     public void Dispose()
     {
+        ThrowIfNotDrawThread();
+
         if (disposed)
         {
             return;
@@ -1094,31 +1171,5 @@ public unsafe sealed class ARCoreVulkanImporter : IDisposable
 
         GC.SuppressFinalize(
             this);
-    }
-
-    ~ARCoreVulkanImporter()
-    {
-        if (disposed)
-        {
-            return;
-        }
-
-        /*
-         * Preserve the prior class behavior by attempting cleanup from the
-         * finalizer. Vulkan destruction is expected to occur during normal
-         * explicit disposal in application code.
-         */
-        try
-        {
-            CleanupExternalResources();
-            CleanupDirectResources();
-        }
-        catch
-        {
-            // Finalizers must not allow cleanup exceptions to escape.
-        }
-
-        disposed =
-            true;
     }
 }

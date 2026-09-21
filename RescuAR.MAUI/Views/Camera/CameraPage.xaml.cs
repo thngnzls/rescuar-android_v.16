@@ -19,6 +19,7 @@ using RescuAR.Navigation.Progress;
 using RescuAR.Navigation.Projection;
 using RescuAR.Navigation.Routing;
 using RescuAR.Navigation.State;
+using RescuAR.Diagnostics;
 using System.Numerics;
 using Microsoft.Maui.Networking;
 using Mapsui;
@@ -69,7 +70,7 @@ namespace RescuAR.App.Views.Camera
         private const string HazardRerouteLogTag =
             "RescuAR-HazardReroute";
 
-        [System.Diagnostics.Conditional("DEBUG")]
+        [System.Diagnostics.Conditional("RESCUAR_DIAGNOSTICS")]
         private static void LogDetailedDebug(
             string tag,
             string message)
@@ -108,21 +109,26 @@ namespace RescuAR.App.Views.Camera
         private readonly object routeProgressFusionSync =
             new();
 
+        private readonly object turnGuidanceSync =
+            new();
+
         private readonly IDispatcherTimer diagnosticTimer;
 
-#if DEBUG
+#if RESCUAR_DIAGNOSTICS && DEBUG
         private const long DetailedStatusLogIntervalMilliseconds =
             10_000;
-#else
+#elif RESCUAR_DIAGNOSTICS
         private const long DetailedStatusLogIntervalMilliseconds =
             30_000;
 #endif
 
         private const long DynamicUiRefreshIntervalMilliseconds =
-            2_000;
+            1_000;
 
+#if RESCUAR_DIAGNOSTICS
         private long lastDetailedStatusLogTimestamp =
             long.MinValue;
+#endif
 
         private long lastDynamicUiRefreshTimestamp =
             long.MinValue;
@@ -148,10 +154,32 @@ namespace RescuAR.App.Views.Camera
             5000;
 
         private bool routeRequestInProgress;
+
+        private const int RouteStartupFreshLocationBudgetMilliseconds =
+            4000;
+
+        private static readonly TimeSpan
+            FallbackBootstrapLocationMaximumAge =
+                TimeSpan.FromSeconds(
+                    120);
+
+        private const double
+            FallbackBootstrapLocationMaximumAccuracyMeters =
+                25.0;
+
+        private const double
+            RouteStartupFreshLocationMaximumAccuracyMeters =
+                50.0;
+
+        private const double
+            FallbackBootstrapFreshAccuracyDisadvantageMeters =
+                15.0;
+
         private bool destinationEventSubscribed;
         private bool emergencyAdvisoryEventSubscribed;
         private bool emergencyAdvisoryVisible;
         private bool pageIsVisible;
+        private bool cameraPipelineTerminalFailureVisible;
 
         private static readonly float[] CameraZoomLevels =
         {
@@ -192,7 +220,8 @@ namespace RescuAR.App.Views.Camera
             currentFloodVisualization =
                 FloodDepthVisualizationService.FloodVisualizationSnapshot.Unavailable;
 
-        private int developerFloodDepthSequenceIndex;
+        private bool? lastFloodGroundVerified;
+        private bool? lastFloodGroundProvisional;
 
         private const int HighSeverityEmergencyAutoStartSeconds =
             5;
@@ -256,113 +285,80 @@ namespace RescuAR.App.Views.Camera
         private bool recoveryConnectorVerified;
 
         /*
-         * TEST SWITCH:
-         * Normal navigation baseline. Set true only for deliberate indoor
-         * GPS-freeze diagnostics.
+         * Diagnostic route-visibility override. The compile-time value comes
+         * from the build profile and is false for every production build.
          */
+        private static readonly bool
+            EnableDiagnosticRouteVisibilityOverride =
+                DiagnosticPrivacyPolicy
+                    .DiagnosticRouteVisibilityOverrideEnabled;
+
+        private bool diagnosticRouteVisibilityOverrideActive;
+
+        private const int LowLightFallbackActivationMilliseconds =
+            1500;
+
+        private bool lowLightFallbackActive;
+
+        private const double RouteLocatorVisibleHalfAngleDegrees =
+            32.0;
+
+        private const double RouteLocatorBehindAngleDegrees =
+            145.0;
+
+        private const float RouteLocatorMinimumTargetDistanceMeters =
+            2.5f;
+
+        private enum RouteLocatorDirection
+        {
+            Hidden = 0,
+            Left = 1,
+            Right = 2,
+            Behind = 3
+        }
+
+        private RouteLocatorDirection lastLoggedRouteLocatorDirection =
+            RouteLocatorDirection.Hidden;
+
+        private RouteLocatorDirection pendingRouteLocatorDirection =
+            RouteLocatorDirection.Hidden;
+
+        private int pendingRouteLocatorConfirmationCount;
+
+        private const int RouteLocatorConfirmationRefreshes =
+            2;
+
+#if RESCUAR_DIAGNOSTICS
         private static readonly bool IndoorRouteTestMode =
             false;
-
-        /*
-         * MILESTONE 3 DEVELOPER VALIDATION HARNESS
-         *
-         * TEMPORARY: keep true only while validating the confirmed-off-route
-         * -> Railway reroute -> replacement-route publication pipeline.
-         *
-         * This does NOT change the real accuracy-aware route corridor. It only
-         * exposes a test button that injects three policy
-         * confirmations while routing from the latest REAL GPS coordinate.
-         *
-         * Set false after Milestone 3 validation; the button then disappears.
-         */
-        private static readonly bool EnableDeveloperOffRouteSimulation =
-            false;
-
-        /*
-         * MILESTONE 3 DEVELOPER TURN-STATE VALIDATION HARNESS
-         *
-         * This is deliberately separate from natural field validation. It
-         * runs controlled synthetic route geometries through the REAL
-         * PedestrianTurnGuidanceService so every classifier branch can be
-         * exercised without changing the active navigation route.
-         *
-         * Keep true only while running the classifier validation. Set false
-         * afterward; the button then disappears.
-         */
-        private static readonly bool EnableDeveloperTurnSimulation =
-            false;
-
-        /*
-         * STAGE 5 DEVELOPER SAFE-ZONE VALIDATION
-         *
-         * Production destinations now use facility-specific safe-zone radii.
-         * This controlled harness intentionally keeps the original 30 m radius
-         * so Stage 5 regression testing remains deterministic. When armed, only
-         * SafeZoneConfirmationService evaluation is temporarily pointed at a
-         * test coordinate 20 m ahead along the CURRENT active route. The real
-         * evacuation-center destination and its facility geofence are unchanged.
-         * Disable after Stage 5 validation.
-         */
-        private static readonly bool EnableDeveloperSafeZoneValidation =
-            true;
-
-        private const double DeveloperSafeZoneTargetAheadMeters =
-            20.0;
-
-        /*
-         * STAGE 7 DEVELOPER FLOOD-DEPTH VISUALIZATION
-         *
-         * The production advisory field `water_level` is a river gauge value,
-         * not local street depth. This temporary harness renders explicit
-         * synthetic LOCAL depth values so the camera UI can be validated
-         * without misrepresenting the live advisory data.
-         */
-        private static readonly bool EnableDeveloperFloodDepthValidation =
-            true;
-
-        private static readonly double?[] DeveloperFloodDepthSequenceMeters =
-        {
-            0.30,
-            0.60,
-            1.00,
-            1.50,
-            null
-        };
-
-        /*
-         * STAGE 10 DEVELOPER DYNAMIC-HAZARD VALIDATION
-         *
-         * This controlled harness injects one geographic road hazard ahead
-         * on the CURRENT route, then exercises the real route/hazard
-         * intersection -> hazard-aware MLD/A* -> AR replacement pipeline. It is
-         * independent from production Approved Community Reports.
-         */
-        private static readonly bool EnableDeveloperDynamicHazardValidation =
-            true;
-
-        private const double DeveloperHazardAheadMeters =
-            45.0;
-
-        private const double DeveloperHazardRadiusMeters =
-            12.0;
-
-        private bool developerHazardValidationArmed;
-
-        private const double DeveloperSimulatedCrossTrackMeters =
-            50.0;
-
-        private const double DeveloperSimulatedGpsAccuracyMeters =
-            5.0;
-
-        /*
-         * The moving-window milestone has already been proven. While indoor
-         * testing continues, freeze route progress so poor GPS and synthetic
-         * test advancement cannot move an otherwise healthy AR route.
-         *
-         * Set IndoorRouteTestMode=false for real outdoor GPS progress.
-         */
         private static readonly bool FreezeRouteProgressDuringIndoorTest =
             true;
+#endif
+
+        private static bool IsIndoorRouteTestModeEnabled
+        {
+            get
+            {
+#if RESCUAR_DIAGNOSTICS
+                return IndoorRouteTestMode;
+#else
+                return false;
+#endif
+            }
+        }
+
+        private static bool IsIndoorRouteProgressFrozen
+        {
+            get
+            {
+#if RESCUAR_DIAGNOSTICS
+                return IndoorRouteTestMode &&
+                    FreezeRouteProgressDuringIndoorTest;
+#else
+                return false;
+#endif
+            }
+        }
 
         /*
          * PDR MILESTONE 1
@@ -434,9 +430,9 @@ namespace RescuAR.App.Views.Camera
         private string lastRerouteResult =
             "None";
 
-        private GeoCoordinate? latestGpsCoordinateForDeveloperReroute;
+        private GeoCoordinate? latestGpsCoordinateForRouting;
 
-        private double? latestGpsAccuracyForDeveloperReroute;
+        private double? latestGpsAccuracyForRouting;
 
         private DateTimeOffset? latestGpsTimestampForRouting;
 
@@ -444,12 +440,62 @@ namespace RescuAR.App.Views.Camera
             lastTurnGuidance =
                 PedestrianTurnGuidanceService.TurnGuidanceSnapshot.Unavailable;
 
+        private PedestrianTurnGuidanceService.VisibleTurnGuidanceSnapshot
+            lastVisibleTurnGuidance =
+                PedestrianTurnGuidanceService.VisibleTurnGuidanceSnapshot.Unavailable;
+
+        private string lastTurnGuidanceConsolidationReason =
+            "Unavailable";
+
+        private double? lastCameraToRouteHeadingDegrees;
+
+        /*
+         * CAMERA-RELATIVE GUIDANCE ALIGNMENT
+         *
+         * The live camera forward direction is always treated as 0 degrees.
+         * Unlike a one-time startup calibration, this remains correct after
+         * the pedestrian turns the phone. Left/right maneuver wording is only
+         * shown while the phone faces along the first cyan route leg.
+         * Hysteresis prevents the instruction from flickering at the boundary.
+         */
+        private const double CameraRouteAlignmentEnterDegrees =
+            25.0;
+
+        private const double CameraRouteAlignmentExitDegrees =
+            40.0;
+
+        private bool cameraAlignedWithVisibleRoute;
+
+        private bool cameraRouteAlignmentInitialized;
+
+        private TurnGuidanceFamily pendingTurnGuidanceFamily =
+            TurnGuidanceFamily.Unavailable;
+
+        private int pendingTurnGuidanceConfirmationCount;
+
+        private const int TurnGuidanceChangeRequiredConfirmations =
+            2;
+
+        private string lastLoggedTurnConsolidationSignature =
+            string.Empty;
+
         private PedestrianTurnGuidanceService.TurnInstruction
             lastLoggedTurnInstruction =
                 PedestrianTurnGuidanceService.TurnInstruction.Continue;
 
         private int lastLoggedTurnDistanceBucket =
             -1;
+
+        private enum TurnGuidanceFamily
+        {
+            Unavailable = 0,
+            Straight = 1,
+            FollowRoute = 2,
+            Left = 3,
+            Right = 4,
+            UTurn = 5,
+            Arrive = 6
+        }
 
         /*
          * STAGE 5 SAFE ZONE CONFIRMATION
@@ -467,24 +513,21 @@ namespace RescuAR.App.Views.Camera
         private int lastLoggedSafeZoneConfirmationCount =
             -1;
 
-        private bool developerSafeZoneValidationArmed;
-
-        private GeoCoordinate? developerSafeZoneTargetCoordinate;
-
-        private double developerSafeZoneTargetProgressMeters =
-            double.NaN;
-
+#if RESCUAR_DIAGNOSTICS
         private const int IndoorStationaryPollsBeforeSyntheticAdvance =
             3;
 
         private const double IndoorSyntheticAdvanceMeters =
             1.5;
+#endif
 
         private static readonly TimeSpan RouteProgressPollInterval =
             TimeSpan.FromSeconds(
                 2);
 
+#if RESCUAR_DIAGNOSTICS
         private int indoorStationaryPollCount;
+#endif
 
         /*
          * Ground-anchor recovery is only armed after this CameraPage has
@@ -523,6 +566,7 @@ namespace RescuAR.App.Views.Camera
                 1);
 
         private CancellationTokenSource? arCoreAutoStartCancellation;
+        private Task? arCoreActivationTask;
 
         private const int ArCoreSurfaceReadyTimeoutMilliseconds =
             3000;
@@ -533,10 +577,17 @@ namespace RescuAR.App.Views.Camera
         private const int ArCoreSurfaceSettleMilliseconds =
             250;
 
+        private static readonly TimeSpan ArCoreActivationTimeout =
+            TimeSpan.FromSeconds(8);
+
         public CameraPage(
             IArCoreService arCoreService)
         {
             InitializeComponent();
+
+#if RESCUAR_DIAGNOSTICS
+            ConfigureDiagnosticControls();
+#endif
 
             this.evergineApplication =
                 new MyApplication();
@@ -577,7 +628,7 @@ namespace RescuAR.App.Views.Camera
             _routeProgressTracker =
                 new RouteProgressTracker(
                     indoorTestMode:
-                        IndoorRouteTestMode);
+                        IsIndoorRouteTestModeEnabled);
 
             _pdrService =
                 new PedestrianDeadReckoningService();
@@ -648,12 +699,14 @@ namespace RescuAR.App.Views.Camera
 
             ARCameraSpatialController.SetRouteRenderingEnabled(
                 arCameraMode &&
+                    !cameraPipelineTerminalFailureVisible &&
                     lastArGuidanceConfidence.AllowsRouteGeometry,
                 $"Camera module view = {mode}; " +
                 $"guidanceState={lastArGuidanceConfidence.State}; {reason}");
 
             SetFloodVisualizationVisibility(
                 floodMode &&
+                    !cameraPipelineTerminalFailureVisible &&
                     currentFloodVisualization.IsAvailable,
                 $"Camera module view = {mode}; {reason}");
 
@@ -667,18 +720,27 @@ namespace RescuAR.App.Views.Camera
                         !mapMode;
 
                     floodDepthOcclusionView.IsVisible =
-                        floodMode;
+                        floodMode &&
+                        !cameraPipelineTerminalFailureVisible;
 
                     cameraModeStatusBanner.IsVisible =
                         arCameraMode;
 
                     floodWaitingBanner.IsVisible =
                         floodMode &&
-                        !currentFloodVisualization.IsAvailable &&
+                        !cameraPipelineTerminalFailureVisible &&
+                        !lowLightFallbackActive &&
+                        (!currentFloodVisualization.IsAvailable ||
+                         (HasLocalFloodDepth() &&
+                          !HasVerifiedArGround())) &&
                         !safeZoneConfirmed;
+
+                    floodWaitingLabel.Text =
+                        GetFloodWaitingMessage();
 
                     floodVisualizationLayer.IsVisible =
                         floodMode &&
+                        !cameraPipelineTerminalFailureVisible &&
                         currentFloodVisualization.IsAvailable &&
                         !safeZoneConfirmed;
 
@@ -694,8 +756,10 @@ namespace RescuAR.App.Views.Camera
                     navigationAwarenessSheet.IsVisible =
                         false;
 
+#if RESCUAR_DIAGNOSTICS
                     floodSimulationConfigurationSheet.IsVisible =
                         false;
+#endif
 
                     arGuidanceSelectedIcon.IsVisible =
                         arCameraMode;
@@ -712,7 +776,8 @@ namespace RescuAR.App.Views.Camera
                     cameraModeSwitcherFloodIcon.IsVisible =
                         floodMode;
 
-                    arDeveloperControls.IsVisible =
+#if RESCUAR_DIAGNOSTICS
+                    diagnosticNavigationControlsHost.IsVisible =
                         false;
 
                     developerSafeZoneTestButton.IsVisible =
@@ -726,6 +791,14 @@ namespace RescuAR.App.Views.Camera
 
                     developerHazardRerouteTestButton.IsVisible =
                         EnableDeveloperDynamicHazardValidation;
+#endif
+
+                    if (!arCameraMode &&
+                        !floodMode)
+                    {
+                        lowLightFallbackBanner.IsVisible =
+                            false;
+                    }
 
                     if (!arCameraMode)
                     {
@@ -734,6 +807,7 @@ namespace RescuAR.App.Views.Camera
                     }
                     else if (!emergencyAdvisoryVisible &&
                              !safeZoneConfirmed &&
+                             !cameraPipelineTerminalFailureVisible &&
                              lastTurnGuidance.IsAvailable)
                     {
                         ApplyPrototypeTurnGuidance(
@@ -753,7 +827,7 @@ namespace RescuAR.App.Views.Camera
                 });
 
 #if ANDROID
-            Log.Debug(
+            LogDetailedDebug(
                 "RescuAR-CameraUI",
                 "Camera module sub-tab changed: " +
                 $"mode={mode}, reason='{reason}'.");
@@ -780,11 +854,8 @@ namespace RescuAR.App.Views.Camera
                 arCoreAutoStartCancellation =
                     null;
 
-                if (_arCoreService.IsInitialized &&
-                    !_arCoreService.IsSessionPaused)
-                {
-                    _arCoreService.PauseCameraSession();
-                }
+                _arCoreService.RequestPause(
+                    $"2D Map selected: {reason}");
 
 #if ANDROID
                 Log.Info(
@@ -807,13 +878,16 @@ namespace RescuAR.App.Views.Camera
             arCoreAutoStartCancellation =
                 new CancellationTokenSource();
 
-            _ =
+            arCoreActivationTask =
                 EnsureArCoreActiveAsync(
                     arCoreAutoStartCancellation.Token);
         }
 
         private void RefreshCameraModuleDynamicUi()
         {
+            RefreshLowLightFallbackState();
+            RefreshFloodGroundTrustState();
+
             bool arCameraMode =
                 currentCameraModuleView ==
                     CameraModuleViewMode.ArCamera;
@@ -825,6 +899,12 @@ namespace RescuAR.App.Views.Camera
             bool mapMode =
                 currentCameraModuleView ==
                     CameraModuleViewMode.Map2D;
+
+            bool verifiedFloodGround =
+                HasVerifiedArGround();
+
+            bool hasLocalFloodDepth =
+                HasLocalFloodDepth();
 
             bool hasDestination =
                 NavigationDestinationBridge.Current.IsAvailable;
@@ -839,10 +919,12 @@ namespace RescuAR.App.Views.Camera
                 !hasDestination &&
                 !safeZoneConfirmed;
 
+#if RESCUAR_DIAGNOSTICS
             developerFloodDepthTestButton.IsVisible =
                 floodMode &&
                 EnableDeveloperFloodDepthValidation &&
                 !safeZoneConfirmed;
+#endif
 
             cameraModeSwitcherButton.IsVisible =
                 !safeZoneConfirmed;
@@ -863,15 +945,270 @@ namespace RescuAR.App.Views.Camera
 
             floodWaitingBanner.IsVisible =
                 floodMode &&
-                !currentFloodVisualization.IsAvailable &&
+                !cameraPipelineTerminalFailureVisible &&
+                !lowLightFallbackActive &&
+                (!currentFloodVisualization.IsAvailable ||
+                 (hasLocalFloodDepth &&
+                  !verifiedFloodGround)) &&
                 !safeZoneConfirmed;
+
+            floodWaitingLabel.Text =
+                GetFloodWaitingMessage();
 
             RefreshEmergencyStatusBanner();
             RefreshArTrackingStatusBanner();
+            RefreshRouteLocatorCue();
+        }
+
+        private void RefreshLowLightFallbackState()
+        {
+            if (cameraPipelineTerminalFailureVisible)
+            {
+                lowLightFallbackActive =
+                    false;
+
+                lowLightFallbackBanner.IsVisible =
+                    false;
+
+                return;
+            }
+
+            ARCameraPoseBridge.SpatialSnapshot spatial =
+                ARCameraPoseBridge.CurrentFrame;
+
+            ARTrackingStateBridge.TrackingSnapshot trackingSnapshot =
+                _arCoreService.TrackingSnapshot;
+            bool insufficientLight =
+                !trackingSnapshot.IsTracking &&
+                !string.IsNullOrWhiteSpace(
+                    trackingSnapshot.FailureReason) &&
+                trackingSnapshot.FailureReason.Contains(
+                    "LIGHT",
+                    StringComparison.OrdinalIgnoreCase);
+
+            ARCameraSpatialController.SpatialContinuitySnapshot continuity =
+                ARCameraSpatialController.CurrentSpatialContinuity;
+
+            bool shouldActivate =
+                insufficientLight &&
+                continuity.DurationMilliseconds >=
+                    LowLightFallbackActivationMilliseconds;
+
+            bool stateChanged =
+                shouldActivate !=
+                    lowLightFallbackActive;
+
+            lowLightFallbackActive =
+                shouldActivate;
+
+            if (stateChanged)
+            {
+                if (lowLightFallbackActive)
+                {
+                    ARFloodDepthBridge.Clear(
+                        "sustained insufficient light");
+                }
+                else if (currentCameraModuleView ==
+                             CameraModuleViewMode.FloodDepth &&
+                         HasLocalFloodDepth() &&
+                         HasVerifiedArGround())
+                {
+                    ARFloodDepthBridge.PublishLocalDepth(
+                        currentFloodVisualization.LocalDepthMeters!.Value,
+                        IsFloodDepthArModeActive(),
+                        currentFloodVisualization.SourceText);
+                }
+            }
+
+            bool showFallback =
+                pageIsVisible &&
+                (currentCameraModuleView ==
+                     CameraModuleViewMode.ArCamera ||
+                 currentCameraModuleView ==
+                     CameraModuleViewMode.FloodDepth) &&
+                lowLightFallbackActive &&
+                !safeZoneConfirmed;
+
+            lowLightFallbackBanner.IsVisible =
+                showFallback;
+
+            lowLightFlashlightButton.Text =
+                _arCoreService.IsFlashlightOn
+                    ? "Turn Off Flashlight"
+                    : "Turn On Flashlight";
+
+            bool floodMode =
+                currentCameraModuleView ==
+                    CameraModuleViewMode.FloodDepth;
+
+            lowLightFallbackTitleLabel.Text =
+                floodMode
+                    ? "Low light—flood visualization unavailable"
+                    : "Low light—ground route unavailable";
+
+            lowLightFallbackMessageLabel.Text =
+                floodMode
+                    ? "Flood depth is paused until tracking recovers. Open the 2D map or use the flashlight when safe."
+                    : "Text guidance remains active. Open the 2D map or use the flashlight when safe.";
+
+#if ANDROID
+            if (stateChanged)
+            {
+                Log.Info(
+                    RouteLogTag,
+                    lowLightFallbackActive
+                        ? "LOW-LIGHT FALLBACK ACTIVE: cyan ground geometry hidden; text guidance, real map access, and flashlight control remain available."
+                        : "LOW-LIGHT FALLBACK CLEARED: AR tracking recovered; normal cyan route confidence evaluation resumed.");
+            }
+#endif
+        }
+
+        private static bool HasVerifiedArGround()
+        {
+            ARCameraPoseBridge.AnchorSnapshot anchor =
+                ARCameraPoseBridge.CurrentFrame.Anchor;
+
+            return anchor.IsAvailable &&
+                !anchor.IsProvisional;
+        }
+
+        private static bool HasProvisionalArGround()
+        {
+            ARCameraPoseBridge.AnchorSnapshot anchor =
+                ARCameraPoseBridge.CurrentFrame.Anchor;
+
+            return anchor.IsAvailable &&
+                anchor.IsProvisional;
+        }
+
+        private static bool HasUsableArGround()
+        {
+            return ARCameraPoseBridge.CurrentFrame.Anchor.IsAvailable;
+        }
+
+        private string GetFloodWaitingMessage()
+        {
+            if (lowLightFallbackActive)
+            {
+                return "Low light — flood visualization paused.";
+            }
+
+            if (HasLocalFloodDepth() &&
+                HasProvisionalArGround())
+            {
+                return "Estimated flood level — calibrating floor...";
+            }
+
+            if (HasLocalFloodDepth() &&
+                !HasVerifiedArGround())
+            {
+                return "Scanning for verified floor...";
+            }
+
+            return "Waiting for simulation...";
+        }
+
+        private bool HasLocalFloodDepth()
+        {
+            return currentFloodVisualization.IsAvailable &&
+                currentFloodVisualization.Mode ==
+                    FloodDepthVisualizationService.FloodVisualizationMode.LocalDepth &&
+                currentFloodVisualization.LocalDepthMeters.HasValue &&
+                double.IsFinite(
+                    currentFloodVisualization.LocalDepthMeters.Value) &&
+                currentFloodVisualization.LocalDepthMeters.Value >
+                    0.0;
+        }
+
+        private bool IsFloodDepthArModeActive() =>
+            pageIsVisible &&
+            currentCameraModuleView == CameraModuleViewMode.FloodDepth &&
+            !lowLightFallbackActive &&
+            !cameraPipelineTerminalFailureVisible &&
+            !safeZoneConfirmed;
+
+        private void RefreshFloodGroundTrustState()
+        {
+            if (cameraPipelineTerminalFailureVisible)
+            {
+                return;
+            }
+
+            bool verifiedGround =
+                HasVerifiedArGround();
+
+            bool provisionalGround =
+                HasProvisionalArGround();
+
+            bool groundAvailable =
+                verifiedGround ||
+                provisionalGround;
+
+            bool groundTrustChanged =
+                !lastFloodGroundVerified.HasValue ||
+                lastFloodGroundVerified.Value != verifiedGround ||
+                !lastFloodGroundProvisional.HasValue ||
+                lastFloodGroundProvisional.Value != provisionalGround;
+
+            bool localFloodActive =
+                IsFloodDepthArModeActive() &&
+                HasLocalFloodDepth();
+
+            if (localFloodActive && groundAvailable)
+            {
+                ARFloodDepthBridge.PublishLocalDepth(
+                    currentFloodVisualization.LocalDepthMeters!.Value,
+                    true,
+                    currentFloodVisualization.SourceText);
+            }
+            else if (pageIsVisible &&
+                     currentCameraModuleView == CameraModuleViewMode.FloodDepth)
+            {
+                ARFloodDepthBridge.Clear(
+                    lowLightFallbackActive
+                        ? "sustained insufficient light"
+                        : "no active Flood Depth mode with an AR ground reference");
+            }
+
+            if (!groundTrustChanged)
+            {
+                return;
+            }
+
+            lastFloodGroundVerified = verifiedGround;
+            lastFloodGroundProvisional = provisionalGround;
+
+#if ANDROID
+            Log.Info(
+                FloodDepthLogTag,
+                "FLOOD GROUND TRUST CHANGED: " +
+                $"verified={verifiedGround}, " +
+                $"provisional={provisionalGround}, " +
+                $"arSpaceWater={(groundAvailable && !lowLightFallbackActive)}. " +
+                (verifiedGround && !lowLightFallbackActive
+                    ? "Verified ARCore ground authorizes exact flood placement."
+                    : provisionalGround && !lowLightFallbackActive
+                        ? "Provisional ground authorizes a reduced-opacity estimated flood visualization."
+                    : lowLightFallbackActive
+                        ? "Flood placement is held while insufficient light prevents reliable tracking."
+                        : "Flood placement is held until an AR ground reference is available."));
+#endif
         }
 
         private void RefreshArTrackingStatusBanner()
         {
+            if (cameraPipelineTerminalFailureVisible)
+            {
+                ARCameraSpatialController.SetRouteRenderingEnabled(
+                    false,
+                    "terminal AR camera pipeline failure is visible");
+
+                return;
+            }
+
+            ARTrackingStateBridge.TrackingSnapshot trackingSnapshot =
+                _arCoreService.TrackingSnapshot;
+
             bool headingTrusted =
                 lastHeadingAlignment.HasValue &&
                 lastHeadingAlignment.Value.IsAvailable &&
@@ -888,6 +1225,9 @@ namespace RescuAR.App.Views.Camera
 
             ARRouteBridge.RouteSnapshot route =
                 ARRouteBridge.Current;
+
+            ARRouteBridge.RouteGeometryQualitySnapshot routeGeometryQuality =
+                ARRouteBridge.GeometryQuality;
 
             RouteProgressTracker.ProgressSnapshot progress =
                 _routeProgressTracker.Current;
@@ -937,7 +1277,8 @@ namespace RescuAR.App.Views.Camera
                     TimeSpan.FromSeconds(
                         10);
 
-            ARGuidanceConfidencePolicy.GuidanceConfidenceSnapshot confidence =
+            ARGuidanceConfidencePolicy.GuidanceConfidenceSnapshot
+                policyConfidence =
                 ARGuidanceConfidencePolicy.Evaluate(
                     NavigationDestinationBridge.Current.IsAvailable,
                     route.IsAvailable,
@@ -951,6 +1292,116 @@ namespace RescuAR.App.Views.Camera
                     continuity,
                     dynamicRerouteInProgress,
                     verifiedRecoveryConnector);
+
+            bool provisionalGround =
+                _arCoreService.IsGroundAnchorProvisional;
+
+            diagnosticRouteVisibilityOverrideActive =
+                ShouldEnableDiagnosticRouteVisibilityOverride(
+                    policyConfidence,
+                    route,
+                    progress,
+                    headingTrusted,
+                    continuity,
+                    provisionalGround);
+
+            ARGuidanceConfidencePolicy.GuidanceConfidenceSnapshot confidence =
+                diagnosticRouteVisibilityOverrideActive
+                    ? policyConfidence with
+                    {
+                        State =
+                            ARGuidanceConfidencePolicy
+                                .GuidanceConfidenceState
+                                .Degraded,
+                        AllowsRouteGeometry = true,
+                        DisplayMessage =
+                            provisionalGround
+                                ? "Ground position estimated — keep the floor visible at the bottom of the camera"
+                                : "GPS accuracy reduced — verify direction with the 2D map"
+                    }
+                    : policyConfidence;
+
+            if (trackingSnapshot.IsAvailable &&
+                !trackingSnapshot.IsTracking &&
+                !trackingSnapshot.IsIntentionalLifecycleEvent)
+            {
+                confidence = confidence with
+                {
+                    State =
+                        ARGuidanceConfidencePolicy
+                            .GuidanceConfidenceState
+                            .Hidden,
+                    AllowsRouteGeometry = false,
+                    DisplayMessage =
+                        GetTrackingRecoveryMessage(
+                            trackingSnapshot.FailureReason)
+                };
+            }
+
+            if (lowLightFallbackActive)
+            {
+                confidence =
+                    confidence with
+                    {
+                        State =
+                            ARGuidanceConfidencePolicy
+                                .GuidanceConfidenceState
+                                .Hidden,
+                        AllowsRouteGeometry = false,
+                        DisplayMessage =
+                            "Low light—ground route unavailable"
+                    };
+            }
+
+            if (confidence.AllowsRouteGeometry &&
+                routeGeometryQuality.IsCurrentFor(
+                    route))
+            {
+                if (routeGeometryQuality.State ==
+                    RouteGeometryQualityState.Pending)
+                {
+                    confidence =
+                        confidence with
+                        {
+                            State =
+                                ARGuidanceConfidencePolicy
+                                    .GuidanceConfidenceState
+                                    .Recovery,
+                            AllowsRouteGeometry = false,
+                            DisplayMessage =
+                                "Preparing AR route geometry…"
+                        };
+                }
+                else if (routeGeometryQuality.State ==
+                         RouteGeometryQualityState.Rejected)
+                {
+                    confidence =
+                        confidence with
+                        {
+                            State =
+                                ARGuidanceConfidencePolicy
+                                    .GuidanceConfidenceState
+                                    .Hidden,
+                            AllowsRouteGeometry = false,
+                            DisplayMessage =
+                                "AR route geometry unavailable — follow text guidance"
+                        };
+                }
+                else if (routeGeometryQuality.IsCapacityLimitedFor(
+                             route))
+                {
+                    confidence =
+                        confidence with
+                        {
+                            State =
+                                ARGuidanceConfidencePolicy
+                                    .GuidanceConfidenceState
+                                    .Degraded,
+                            DisplayMessage =
+                                "Complex route simplified — confirm turns with text guidance"
+                        };
+                }
+            }
 
             bool confidenceChanged =
                 confidence.State !=
@@ -986,7 +1437,14 @@ namespace RescuAR.App.Views.Camera
                     $"gpsFresh={gpsFresh}, " +
                     $"gps={gpsConfidence}, " +
                     $"routeMatch={routeMatchConfidence}, " +
+                    $"routeGeometry={routeGeometryQuality.State}, " +
+                    $"routeGeometryPoints=" +
+                    $"{routeGeometryQuality.RenderedPointCount}/" +
+                    $"{routeGeometryQuality.DetailedPointCount}, " +
                     $"spatial={continuity.State}, " +
+                    $"provisionalGround={provisionalGround}, " +
+                    $"diagnosticOverride=" +
+                    $"{diagnosticRouteVisibilityOverrideActive}, " +
                     $"reason='{confidence.DisplayMessage}'.");
             }
 #endif
@@ -994,6 +1452,7 @@ namespace RescuAR.App.Views.Camera
             bool shouldShow =
                 arCameraMode &&
                 NavigationDestinationBridge.Current.IsAvailable &&
+                !lowLightFallbackActive &&
                 confidence.State !=
                     ARGuidanceConfidencePolicy.GuidanceConfidenceState.Full;
 
@@ -1003,11 +1462,15 @@ namespace RescuAR.App.Views.Camera
             turnGuidancePanel.Margin =
                 new Thickness(
                     8,
-                    shouldShow
-                        ? 88
-                        : 48,
+                    lowLightFallbackActive
+                        ? 158
+                        : shouldShow
+                            ? 88
+                            : 48,
                     8,
                     0);
+
+            RefreshTurnGuidancePanelForCurrentState();
 
             if (!shouldShow)
             {
@@ -1039,6 +1502,517 @@ namespace RescuAR.App.Views.Camera
 
             arTrackingStatusLabel.Text =
                 confidence.DisplayMessage;
+        }
+
+        private static string GetTrackingRecoveryMessage(
+            string failureReason)
+        {
+            if (failureReason.Contains(
+                    "LIGHT",
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                return "AR tracking paused—move to a brighter area";
+            }
+
+            if (failureReason.Contains(
+                    "MOTION",
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                return "AR tracking paused—move the phone more slowly";
+            }
+
+            if (failureReason.Contains(
+                    "FEATURE",
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                return "AR tracking paused—aim at a textured surface";
+            }
+
+            if (failureReason.Contains(
+                    "CAMERA",
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                return "AR camera interrupted—return to the camera view";
+            }
+
+            return "AR tracking paused—hold the phone steady";
+        }
+
+        private bool ShouldEnableDiagnosticRouteVisibilityOverride(
+            ARGuidanceConfidencePolicy.GuidanceConfidenceSnapshot
+                policyConfidence,
+            ARRouteBridge.RouteSnapshot route,
+            RouteProgressTracker.ProgressSnapshot progress,
+            bool headingTrusted,
+            ARCameraSpatialController.SpatialContinuitySnapshot spatial,
+            bool provisionalGround)
+        {
+            if (!EnableDiagnosticRouteVisibilityOverride ||
+                (policyConfidence.AllowsRouteGeometry &&
+                 !provisionalGround) ||
+                !NavigationDestinationBridge.Current.IsAvailable ||
+                !route.IsAvailable ||
+                !route.NavigationState.IsAvailable ||
+                route.NavigationState.VisualKind !=
+                    RouteVisualKind.RouteWindow ||
+                !progress.HasRoute ||
+                !headingTrusted ||
+                dynamicRerouteInProgress)
+            {
+                return false;
+            }
+
+            return spatial.State ==
+                       ARCameraSpatialController.SpatialContinuityState.Live ||
+                   spatial.State ==
+                       ARCameraSpatialController.SpatialContinuityState.ShortHold;
+        }
+
+        private void RefreshRouteLocatorCue()
+        {
+            RouteLocatorDirection candidateDirection =
+                RouteLocatorDirection.Hidden;
+
+            double signedAngleDegrees =
+                0.0;
+
+            bool routeVisibleInView =
+                false;
+
+            if (currentCameraModuleView ==
+                    CameraModuleViewMode.ArCamera &&
+                pageIsVisible &&
+                !emergencyAdvisoryVisible &&
+                !safeZoneConfirmed &&
+                !dynamicRerouteInProgress &&
+                lastArGuidanceConfidence.AllowsRouteGeometry &&
+                TryGetRouteLocatorAngle(
+                    out signedAngleDegrees,
+                    out routeVisibleInView) &&
+                !routeVisibleInView)
+            {
+                double absoluteAngle =
+                    Math.Abs(
+                        signedAngleDegrees);
+
+                if (absoluteAngle >=
+                    RouteLocatorBehindAngleDegrees)
+                {
+                    candidateDirection =
+                        RouteLocatorDirection.Behind;
+                }
+                else if (absoluteAngle >
+                         RouteLocatorVisibleHalfAngleDegrees)
+                {
+                    candidateDirection =
+                        signedAngleDegrees <
+                            0.0
+                            ? RouteLocatorDirection.Left
+                            : RouteLocatorDirection.Right;
+                }
+            }
+
+            RouteLocatorDirection direction =
+                StabilizeRouteLocatorDirection(
+                    candidateDirection);
+
+            routeLocatorPanel.IsVisible =
+                direction !=
+                    RouteLocatorDirection.Hidden;
+
+            switch (direction)
+            {
+                case RouteLocatorDirection.Left:
+                    routeLocatorIcon.Source =
+                        "lucide_arrow_up_left_teal.png";
+                    routeLocatorLabel.Text =
+                        "Look left to find the cyan route";
+                    break;
+
+                case RouteLocatorDirection.Right:
+                    routeLocatorIcon.Source =
+                        "lucide_arrow_up_right_teal.png";
+                    routeLocatorLabel.Text =
+                        "Look right to find the cyan route";
+                    break;
+
+                case RouteLocatorDirection.Behind:
+                    routeLocatorIcon.Source =
+                        signedAngleDegrees <
+                            0.0
+                            ? "lucide_arrow_up_left_teal.png"
+                            : "lucide_arrow_up_right_teal.png";
+                    routeLocatorLabel.Text =
+                        "Turn your phone around to find the cyan route";
+                    break;
+            }
+
+#if ANDROID
+            if (direction !=
+                lastLoggedRouteLocatorDirection)
+            {
+                LogDetailedDebug(
+                    RouteLogTag,
+                    "ROUTE LOCATOR CUE: " +
+                    $"direction={direction}, " +
+                    $"cameraToRouteAngle={signedAngleDegrees:F1} deg, " +
+                    $"routeVisibleInView={routeVisibleInView}. " +
+                    "Cue is view-only; route geometry and search decisions " +
+                    "remain unchanged.");
+            }
+#endif
+
+            lastLoggedRouteLocatorDirection =
+                direction;
+        }
+
+        private RouteLocatorDirection StabilizeRouteLocatorDirection(
+            RouteLocatorDirection candidate)
+        {
+            /*
+             * Hiding a locator that is no longer trustworthy must be
+             * immediate. Showing it (or changing its side) requires two
+             * consecutive one-second observations so phone rotation and
+             * route-window updates do not make the cue flicker.
+             */
+            if (candidate ==
+                RouteLocatorDirection.Hidden)
+            {
+                pendingRouteLocatorDirection =
+                    RouteLocatorDirection.Hidden;
+
+                pendingRouteLocatorConfirmationCount =
+                    0;
+
+                return RouteLocatorDirection.Hidden;
+            }
+
+            if (candidate ==
+                lastLoggedRouteLocatorDirection)
+            {
+                pendingRouteLocatorDirection =
+                    RouteLocatorDirection.Hidden;
+
+                pendingRouteLocatorConfirmationCount =
+                    0;
+
+                return candidate;
+            }
+
+            if (candidate !=
+                pendingRouteLocatorDirection)
+            {
+                pendingRouteLocatorDirection =
+                    candidate;
+
+                pendingRouteLocatorConfirmationCount =
+                    1;
+
+                return RouteLocatorDirection.Hidden;
+            }
+
+            pendingRouteLocatorConfirmationCount++;
+
+            if (pendingRouteLocatorConfirmationCount <
+                RouteLocatorConfirmationRefreshes)
+            {
+                return RouteLocatorDirection.Hidden;
+            }
+
+            pendingRouteLocatorDirection =
+                RouteLocatorDirection.Hidden;
+
+            pendingRouteLocatorConfirmationCount =
+                0;
+
+            return candidate;
+        }
+
+        private static bool TryGetRouteLocatorAngle(
+            out double signedAngleDegrees,
+            out bool routeVisibleInView)
+        {
+            signedAngleDegrees =
+                0.0;
+
+            routeVisibleInView =
+                false;
+
+            ARCameraPoseBridge.SpatialSnapshot spatial =
+                ARCameraPoseBridge.CurrentFrame;
+
+            ARRouteBridge.RouteSnapshot route =
+                ARRouteBridge.Current;
+
+            if (!spatial.IsTracking ||
+                !spatial.Pose.IsTracking ||
+                !spatial.Anchor.IsAvailable ||
+                !route.IsAvailable ||
+                route.Points.Count <
+                    2)
+            {
+                return false;
+            }
+
+            Quaternion rotation =
+                new(
+                    spatial.Pose.RotationX,
+                    spatial.Pose.RotationY,
+                    spatial.Pose.RotationZ,
+                    spatial.Pose.RotationW);
+
+            float quaternionLengthSquared =
+                rotation.LengthSquared();
+
+            if (!float.IsFinite(
+                    quaternionLengthSquared) ||
+                quaternionLengthSquared <
+                    0.0001f)
+            {
+                return false;
+            }
+
+            Quaternion cameraInverseRotation =
+                Quaternion.Inverse(
+                    Quaternion.Normalize(
+                        rotation));
+
+            bool preferredTargetAvailable =
+                false;
+
+            float preferredTargetDistance =
+                float.MaxValue;
+
+            double preferredTargetAngle =
+                0.0;
+
+            bool fallbackTargetAvailable =
+                false;
+
+            float fallbackTargetDistance =
+                float.MinValue;
+
+            double fallbackTargetAngle =
+                0.0;
+
+            bool previousPointAvailable =
+                false;
+
+            bool previousPointInFront =
+                false;
+
+            double previousPointAngle =
+                0.0;
+
+            for (int i = 0;
+                 i < route.Points.Count;
+                 i++)
+            {
+                ArHorizontalRoutePoint point =
+                    route.Points[i];
+
+                float worldX =
+                    spatial.Anchor.PositionX +
+                        point.X;
+
+                float worldZ =
+                    spatial.Anchor.PositionZ +
+                        point.Z;
+
+                float deltaX =
+                    worldX -
+                        spatial.Pose.PositionX;
+
+                float deltaZ =
+                    worldZ -
+                        spatial.Pose.PositionZ;
+
+                Vector3 cameraLocalDelta =
+                    Vector3.Transform(
+                        new Vector3(
+                            deltaX,
+                            0.0f,
+                            deltaZ),
+                        cameraInverseRotation);
+
+                float distance =
+                    MathF.Sqrt(
+                        cameraLocalDelta.X *
+                            cameraLocalDelta.X +
+                        cameraLocalDelta.Z *
+                            cameraLocalDelta.Z);
+
+                if (!float.IsFinite(distance) ||
+                    distance <
+                        0.10f)
+                {
+                    continue;
+                }
+
+                bool pointInFront =
+                    cameraLocalDelta.Z <
+                        -0.10f;
+
+                double pointAngle =
+                    NormalizeSignedDegrees(
+                        RadiansToDegrees(
+                            Math.Atan2(
+                                cameraLocalDelta.X,
+                                -cameraLocalDelta.Z)));
+
+                /*
+                 * Camera-local +X is screen-right. This is the coordinate
+                 * system the user actually sees and avoids the former
+                 * world-azimuth sign inversion. Suppress the locator whenever
+                 * a route point or segment already crosses the visible view.
+                 */
+                if (pointInFront &&
+                    Math.Abs(pointAngle) <=
+                        RouteLocatorVisibleHalfAngleDegrees)
+                {
+                    signedAngleDegrees =
+                        pointAngle;
+
+                    routeVisibleInView =
+                        true;
+
+                    return true;
+                }
+
+                if (previousPointAvailable &&
+                    previousPointInFront &&
+                    pointInFront &&
+                    Math.Sign(previousPointAngle) !=
+                        Math.Sign(pointAngle))
+                {
+                    signedAngleDegrees =
+                        0.0;
+
+                    routeVisibleInView =
+                        true;
+
+                    return true;
+                }
+
+                previousPointAvailable =
+                    true;
+
+                previousPointInFront =
+                    pointInFront;
+
+                previousPointAngle =
+                    pointAngle;
+
+                if (distance >=
+                        RouteLocatorMinimumTargetDistanceMeters &&
+                    distance <
+                        preferredTargetDistance)
+                {
+                    preferredTargetAvailable =
+                        true;
+
+                    preferredTargetDistance =
+                        distance;
+
+                    preferredTargetAngle =
+                        pointAngle;
+                }
+
+                if (distance >
+                    fallbackTargetDistance)
+                {
+                    fallbackTargetAvailable =
+                        true;
+
+                    fallbackTargetDistance =
+                        distance;
+
+                    fallbackTargetAngle =
+                        pointAngle;
+                }
+            }
+
+            if (preferredTargetAvailable)
+            {
+                signedAngleDegrees =
+                    preferredTargetAngle;
+
+                return true;
+            }
+
+            if (fallbackTargetAvailable)
+            {
+                signedAngleDegrees =
+                    fallbackTargetAngle;
+
+                return true;
+            }
+
+            return false;
+        }
+
+        private void RefreshTurnGuidancePanelForCurrentState()
+        {
+            if (dynamicRerouteInProgress)
+            {
+                return;
+            }
+
+            RouteResult? acceptedRoute;
+
+            ARRouteBridge.RouteSnapshot route;
+
+            lock (routeProgressFusionSync)
+            {
+                acceptedRoute =
+                    activeRoute;
+
+                route =
+                    ARRouteBridge.Current;
+            }
+
+            bool routeIdentityMatches =
+                acceptedRoute is not null &&
+                string.Equals(
+                    route.Algorithm,
+                    acceptedRoute.Algorithm,
+                    StringComparison.Ordinal) &&
+                double.IsFinite(
+                    route.TotalDistanceMeters) &&
+                double.IsFinite(
+                    acceptedRoute.TotalDistanceMeters) &&
+                Math.Abs(
+                    route.TotalDistanceMeters -
+                    acceptedRoute.TotalDistanceMeters) <=
+                        0.50;
+
+            bool shouldShow =
+                currentCameraModuleView ==
+                    CameraModuleViewMode.ArCamera &&
+                pageIsVisible &&
+                !emergencyAdvisoryVisible &&
+                !safeZoneConfirmed &&
+                NavigationDestinationBridge.Current.IsAvailable &&
+                routeIdentityMatches &&
+                route.IsAvailable &&
+                route.NavigationState.IsAvailable &&
+                route.NavigationState.VisualKind ==
+                    RouteVisualKind.RouteWindow &&
+                lastTurnGuidance.IsAvailable;
+
+            if (!shouldShow)
+            {
+                turnGuidancePanel.IsVisible =
+                    false;
+
+                return;
+            }
+
+            ApplyPrototypeTurnGuidance(
+                lastTurnGuidance);
+
+            turnGuidancePanel.IsVisible =
+                true;
         }
 
         private void RefreshEmergencyStatusBanner()
@@ -1263,7 +2237,7 @@ namespace RescuAR.App.Views.Camera
 #if ANDROID
                 Log.Warn(
                     "RescuAR-CameraUI",
-                    $"Camera flashlight toggle failed: {exception.Message}");
+                    $"Camera flashlight toggle failed: {DiagnosticPrivacyPolicy.FormatException(exception)}");
 #endif
 
                 RefreshCameraControlUi();
@@ -1305,6 +2279,11 @@ namespace RescuAR.App.Views.Camera
 
             bool flashlightOn =
                 _arCoreService.IsFlashlightOn;
+
+            lowLightFlashlightButton.Text =
+                flashlightOn
+                    ? "Turn Off Flashlight"
+                    : "Turn On Flashlight";
 
             cameraFlashlightButton.BackgroundColor =
                 Color.FromArgb(
@@ -1357,11 +2336,13 @@ namespace RescuAR.App.Views.Camera
             navigationAwarenessSheet.IsVisible =
                 true;
 
-            arDeveloperControls.IsVisible =
+#if RESCUAR_DIAGNOSTICS
+            diagnosticNavigationControlsHost.IsVisible =
                 currentCameraModuleView ==
                     CameraModuleViewMode.ArCamera &&
                 (EnableDeveloperSafeZoneValidation ||
                  EnableDeveloperDynamicHazardValidation);
+#endif
         }
 
         private void OnNavigationAwarenessCloseClicked(
@@ -1425,11 +2406,12 @@ namespace RescuAR.App.Views.Camera
 #if ANDROID
                 Log.Warn(
                     "RescuAR-CameraUI",
-                    $"Explore Safe Zones navigation failed: {exception.Message}");
+                    $"Explore Safe Zones navigation failed: {DiagnosticPrivacyPolicy.FormatException(exception)}");
 #endif
             }
         }
 
+#if RESCUAR_DIAGNOSTICS
         private void OnFloodSimulationConfigureClicked(
             object? sender,
             EventArgs e)
@@ -1514,6 +2496,7 @@ namespace RescuAR.App.Views.Camera
                 $"depth={depth:F2}m, groundRelative=True.");
 #endif
         }
+#endif
 
         private async void OnCameraHeaderBackClicked(
             object? sender,
@@ -1532,7 +2515,7 @@ namespace RescuAR.App.Views.Camera
 #if ANDROID
                 Log.Warn(
                     "RescuAR-CameraUI",
-                    $"Camera header Back navigation failed: {exception.Message}");
+                    $"Camera header Back navigation failed: {DiagnosticPrivacyPolicy.FormatException(exception)}");
 #endif
             }
         }
@@ -1559,7 +2542,7 @@ namespace RescuAR.App.Views.Camera
 #if ANDROID
                 Log.Warn(
                     "RescuAR-CameraUI",
-                    $"Camera settings navigation failed: {exception.Message}");
+                    $"Camera settings navigation failed: {DiagnosticPrivacyPolicy.FormatException(exception)}");
 #endif
             }
         }
@@ -1581,7 +2564,7 @@ namespace RescuAR.App.Views.Camera
 #if ANDROID
                 Log.Warn(
                     "RescuAR-CameraUI",
-                    $"Camera notifications navigation failed: {exception.Message}");
+                    $"Camera notifications navigation failed: {DiagnosticPrivacyPolicy.FormatException(exception)}");
 #endif
             }
         }
@@ -1611,19 +2594,25 @@ namespace RescuAR.App.Views.Camera
         {
             base.OnAppearing();
 
+#if RESCUAR_DIAGNOSTICS
+            RequestDiagnosticLocationConsent();
+#endif
+
             pageIsVisible =
                 true;
 
+#if RESCUAR_DIAGNOSTICS
             lastDetailedStatusLogTimestamp =
                 long.MinValue;
+#endif
 
             lastDynamicUiRefreshTimestamp =
                 long.MinValue;
 
             RefreshCameraControlUi();
 
-#if ANDROID
-            Log.Debug(
+#if ANDROID && RESCUAR_DIAGNOSTICS
+            LogDetailedDebug(
                 ArCoreLogTag,
                 "Camera tab entered.");
 
@@ -1645,6 +2634,10 @@ namespace RescuAR.App.Views.Camera
             SubscribeDestinationChanged();
             SubscribeEmergencyAdvisories();
             SubscribeConnectivityChanges();
+            _arCoreService.LifecycleChanged -=
+                OnArCoreLifecycleChanged;
+            _arCoreService.LifecycleChanged +=
+                OnArCoreLifecycleChanged;
 
             ScheduleNetworkLossFailoverIfNeeded(
                 "Camera tab entered");
@@ -1685,6 +2678,8 @@ namespace RescuAR.App.Views.Camera
             UnsubscribeDestinationChanged();
             UnsubscribeEmergencyAdvisories();
             UnsubscribeConnectivityChanges();
+            _arCoreService.LifecycleChanged -=
+                OnArCoreLifecycleChanged;
             CancelConnectivityFailover(
                 "Camera tab exited");
             HideEmergencyAdvisoryOverlay(
@@ -1694,8 +2689,10 @@ namespace RescuAR.App.Views.Camera
             navigationAwarenessSheet.IsVisible =
                 false;
 
+#if RESCUAR_DIAGNOSTICS
             floodSimulationConfigurationSheet.IsVisible =
                 false;
+#endif
 
             SetFloodVisualizationVisibility(
                 false,
@@ -1720,7 +2717,7 @@ namespace RescuAR.App.Views.Camera
             _headingAlignmentService.Stop();
 
 #if ANDROID
-            Log.Debug(
+            LogDetailedDebug(
                 ArCoreLogTag,
                 "Camera tab exited. Releasing ARCore camera.");
 #endif
@@ -1730,20 +2727,121 @@ namespace RescuAR.App.Views.Camera
              * camera/ARCore policy from remaining active on Home/Map/etc.
              * The Session and guidance state are retained for Camera re-entry.
              */
-            if (_arCoreService.IsInitialized &&
-                !_arCoreService.IsSessionPaused)
-            {
-                _arCoreService.PauseCameraSession();
-            }
+            _arCoreService.RequestPause(
+                "Camera tab exited");
 
 #if ANDROID
-            Log.Debug(
+            LogDetailedDebug(
                 RouteLogTag,
                 "CameraPage disappearing. AR/route status diagnostics stopped.");
 #endif
 
             base.OnDisappearing();
         }
+
+        private void OnArCoreLifecycleChanged(
+            ArCoreLifecycleSnapshot snapshot)
+        {
+            if (IsTerminalCameraPipelineFailure(
+                    snapshot.Failure))
+            {
+                Dispatcher.Dispatch(
+                    () => ApplyTerminalCameraPipelineFailure(
+                        snapshot.Failure));
+
+                return;
+            }
+
+            if (snapshot.State !=
+                ArCoreLifecycleState.Running)
+            {
+                return;
+            }
+
+            Dispatcher.Dispatch(
+                () =>
+                {
+                    cameraPipelineTerminalFailureVisible =
+                        false;
+
+                    if (pageIsVisible &&
+                        currentCameraModuleView !=
+                            CameraModuleViewMode.Map2D)
+                    {
+                        RefreshArTrackingStatusBanner();
+                        StartRouteRequestIfPossible();
+                    }
+                });
+        }
+
+        private static bool IsTerminalCameraPipelineFailure(
+            ArCoreFailure failure) =>
+            failure.Classification ==
+                ArCoreFailureClassification.Terminal &&
+            failure.Code is
+                ArCoreFailureCode.NativeBridgeUnavailable or
+                ArCoreFailureCode.CameraPassthroughUnavailable or
+                ArCoreFailureCode.RendererUnavailable;
+
+        private void ApplyTerminalCameraPipelineFailure(
+            ArCoreFailure failure)
+        {
+            cameraPipelineTerminalFailureVisible =
+                true;
+
+            ARFloodDepthBridge.Clear(
+                $"terminal camera pipeline failure: {failure.Code}");
+
+            ARCameraSpatialController.SetRouteRenderingEnabled(
+                false,
+                $"terminal camera pipeline failure: {failure.Code}");
+
+            turnGuidancePanel.IsVisible =
+                false;
+
+            floodDepthOcclusionView.IsVisible =
+                false;
+
+            floodVisualizationLayer.IsVisible =
+                false;
+
+            floodWaitingBanner.IsVisible =
+                false;
+
+            lowLightFallbackBanner.IsVisible =
+                false;
+
+            arTrackingStatusBanner.BackgroundColor =
+                Color.FromArgb(
+                    "#FBE1E3");
+
+            arTrackingStatusBanner.Stroke =
+                new SolidColorBrush(
+                    Color.FromArgb(
+                        "#F2B4BA"));
+
+            arTrackingStatusLabel.TextColor =
+                Color.FromArgb(
+                    "#B4232B");
+
+            arTrackingStatusLabel.Text =
+                failure.Message;
+
+            arTrackingStatusBanner.IsVisible =
+                pageIsVisible &&
+                currentCameraModuleView !=
+                    CameraModuleViewMode.Map2D;
+        }
+
+        private static bool ShouldSuppressArCoreFailureAlert(
+            ArCoreFailureCode code) =>
+            code is
+                ArCoreFailureCode.InstallationRequired or
+                ArCoreFailureCode.Superseded or
+                ArCoreFailureCode.Cancelled or
+                ArCoreFailureCode.GraphicsUnavailable or
+                ArCoreFailureCode.AvailabilityPending or
+                ArCoreFailureCode.ActivityUnavailable;
 
         /// <summary>
         /// Ensures ARCore is active whenever the Camera tab is visible.
@@ -1768,11 +2866,19 @@ namespace RescuAR.App.Views.Camera
 
             try
             {
-                await arCoreActivationGate.WaitAsync(
-                    cancellationToken);
-
                 gateEntered =
-                    true;
+                    await arCoreActivationGate.WaitAsync(
+                        ArCoreActivationTimeout,
+                        cancellationToken);
+
+                if (!gateEntered)
+                {
+                    Log.Error(
+                        ArCoreLogTag,
+                        "Camera-tab ARCore activation timed out waiting for a previous request.");
+
+                    return false;
+                }
 
                 cancellationToken.ThrowIfCancellationRequested();
 
@@ -1790,14 +2896,18 @@ namespace RescuAR.App.Views.Camera
                  */
                 if (_arCoreService.IsInitialized)
                 {
-                    Log.Debug(
+                    LogDetailedDebug(
                         ArCoreLogTag,
                         "Camera tab auto-start: resuming retained ARCore Session.");
 
-                    bool resumed =
-                        _arCoreService.ResumeCameraSession();
+                    ArCoreLifecycleResult resumeResult =
+                        await _arCoreService.EnsureRunningAsync(
+                            cancellationToken);
 
-                    Log.Debug(
+                    bool resumed =
+                        resumeResult.Success;
+
+                    LogDetailedDebug(
                         ArCoreLogTag,
                         "Camera tab ARCore resume result = " +
                         $"{resumed}; " +
@@ -1808,7 +2918,8 @@ namespace RescuAR.App.Views.Camera
                         currentCameraModuleView ==
                             CameraModuleViewMode.Map2D)
                     {
-                        _arCoreService.PauseCameraSession();
+                        _arCoreService.RequestPause(
+                            "2D Map selected while ARCore resume completed");
 
                         return false;
                     }
@@ -1818,7 +2929,7 @@ namespace RescuAR.App.Views.Camera
                     {
                         if (CanResumeRetainedRoute())
                         {
-                            Log.Debug(
+                            LogDetailedDebug(
                                 MldLogTag,
                                 "Camera re-entry is using the retained MLD route. " +
                                 "No new Railway request and no route-progress reset.");
@@ -1827,7 +2938,7 @@ namespace RescuAR.App.Views.Camera
                         }
                         else
                         {
-                            Log.Debug(
+                            LogDetailedDebug(
                                 MldLogTag,
                                 "Camera re-entry has no compatible retained route. " +
                                 "Requesting MLD route for the current destination.");
@@ -1836,22 +2947,27 @@ namespace RescuAR.App.Views.Camera
                         }
                     }
                     else if (!resumed &&
-                             pageIsVisible)
+                             pageIsVisible &&
+                             !ShouldSuppressArCoreFailureAlert(
+                                 resumeResult.Failure.Code))
                     {
                         Log.Error(
                             ArCoreLogTag,
-                            "Retained ARCore Session could not be resumed.");
+                            "Retained ARCore Session could not be resumed: " +
+                            $"code={resumeResult.Failure.Code}, " +
+                            $"classification={resumeResult.Failure.Classification}, " +
+                            $"message='{resumeResult.Failure.Message}'.");
 
                         await DisplayAlert(
                             "AR Camera",
-                            "The AR camera could not be resumed. Leave the Camera tab and try again.",
+                            resumeResult.Failure.Message,
                             "OK");
                     }
 
                     return resumed;
                 }
 
-                Log.Debug(
+                LogDetailedDebug(
                     ArCoreLogTag,
                     "Camera tab auto-start: first ARCore Session is not yet " +
                     "initialized. Waiting for the Evergine camera surface.");
@@ -1865,7 +2981,7 @@ namespace RescuAR.App.Views.Camera
                     currentCameraModuleView ==
                         CameraModuleViewMode.Map2D)
                 {
-                    Log.Debug(
+                    LogDetailedDebug(
                         ArCoreLogTag,
                         "Automatic ARCore initialization cancelled because " +
                         "the active view no longer needs the camera.");
@@ -1880,7 +2996,7 @@ namespace RescuAR.App.Views.Camera
                 if (permissionStatus !=
                     PermissionStatus.Granted)
                 {
-                    Log.Debug(
+                    LogDetailedDebug(
                         ArCoreLogTag,
                         "Camera tab auto-start requesting Android camera permission.");
 
@@ -1889,7 +3005,7 @@ namespace RescuAR.App.Views.Camera
                             Permissions.Camera>();
                 }
 
-                Log.Debug(
+                LogDetailedDebug(
                     ArCoreLogTag,
                     $"Camera permission status: {permissionStatus}");
 
@@ -1950,14 +3066,18 @@ namespace RescuAR.App.Views.Camera
                 ARCameraSpatialController.ResetRouteRootLock(
                     "creating a new ARCore Session");
 
-                Log.Debug(
+                LogDetailedDebug(
                     ArCoreLogTag,
                     "Camera tab auto-start: initializing new ARCore Session.");
 
-                bool initialized =
-                    _arCoreService.Initialize();
+                ArCoreLifecycleResult initializationResult =
+                    await _arCoreService.EnsureRunningAsync(
+                        cancellationToken);
 
-                Log.Debug(
+                bool initialized =
+                    initializationResult.Success;
+
+                LogDetailedDebug(
                     ArCoreLogTag,
                     "Automatic ARCore start returned: " +
                     $"{initialized}; " +
@@ -1968,13 +3088,18 @@ namespace RescuAR.App.Views.Camera
                 {
                     Log.Error(
                         ArCoreLogTag,
-                        "Automatic ARCore initialization failed.");
+                        "Automatic ARCore initialization failed: " +
+                        $"code={initializationResult.Failure.Code}, " +
+                        $"classification={initializationResult.Failure.Classification}, " +
+                        $"message='{initializationResult.Failure.Message}'.");
 
-                    if (pageIsVisible)
+                    if (pageIsVisible &&
+                        !ShouldSuppressArCoreFailureAlert(
+                            initializationResult.Failure.Code))
                     {
                         await DisplayAlert(
                             "AR Camera",
-                            "ARCore could not be initialized. Check Logcat for RescuAR-ARCore.",
+                            initializationResult.Failure.Message,
                             "OK");
                     }
 
@@ -1985,12 +3110,13 @@ namespace RescuAR.App.Views.Camera
                     currentCameraModuleView ==
                         CameraModuleViewMode.Map2D)
                 {
-                    _arCoreService.PauseCameraSession();
+                    _arCoreService.RequestPause(
+                        "Camera view became inactive after ARCore initialization");
 
                     return false;
                 }
 
-                Log.Debug(
+                LogDetailedDebug(
                     MldLogTag,
                     "ARCore automatically active. Checking navigation " +
                     "destination for MLD routing.");
@@ -2004,7 +3130,7 @@ namespace RescuAR.App.Views.Camera
             }
             catch (OperationCanceledException)
             {
-                Log.Debug(
+                LogDetailedDebug(
                     ArCoreLogTag,
                     "Camera-tab ARCore auto-start cancelled.");
 
@@ -2014,7 +3140,7 @@ namespace RescuAR.App.Views.Camera
             {
                 Log.Error(
                     ArCoreLogTag,
-                    $"Camera-tab ARCore activation failed: {exception}");
+                    $"Camera-tab ARCore activation failed: {DiagnosticPrivacyPolicy.FormatException(exception)}");
 
                 if (pageIsVisible)
                 {
@@ -2069,7 +3195,7 @@ namespace RescuAR.App.Views.Camera
                 if (handlerReady &&
                     sizeReady)
                 {
-                    Log.Debug(
+                    LogDetailedDebug(
                         ArCoreLogTag,
                         "Evergine Camera surface ready for automatic ARCore " +
                         $"startup: " +
@@ -2121,7 +3247,7 @@ namespace RescuAR.App.Views.Camera
 #if ANDROID
             if (!pageIsVisible)
             {
-                Log.Debug(
+                LogDetailedDebug(
                     MldLogTag,
                     "MLD route request skipped: Camera tab is not active.");
 
@@ -2131,7 +3257,7 @@ namespace RescuAR.App.Views.Camera
             if (!_arCoreService.IsInitialized ||
                 _arCoreService.IsSessionPaused)
             {
-                Log.Debug(
+                LogDetailedDebug(
                     MldLogTag,
                     "MLD route request skipped: ARCore Session is not active.");
 
@@ -2140,7 +3266,7 @@ namespace RescuAR.App.Views.Camera
 
             if (routeRequestInProgress)
             {
-                Log.Debug(
+                LogDetailedDebug(
                     MldLogTag,
                     "MLD route request skipped: another request is in progress.");
 
@@ -2178,10 +3304,10 @@ namespace RescuAR.App.Views.Camera
 
             try
             {
-                Log.Debug(
+                LogDetailedDebug(
                     MldLogTag,
-                    "Requesting current GPS location for MLD origin through " +
-                    "RescuAR location service.");
+                    "Resolving the MLD route-start origin with bounded fresh " +
+                    "GPS and the diagnostic fallback cache policy.");
 
                 if (!await _locationService.EnsurePermissionAsync(
                         cancellationToken))
@@ -2193,8 +3319,10 @@ namespace RescuAR.App.Views.Camera
                     return false;
                 }
 
-                LocationReading? locationReading =
-                    await _locationService.GetCurrentLocationAsync(
+                (LocationReading? locationReading,
+                 string locationSource,
+                 bool usedFallbackBootstrap) =
+                    await ResolveRouteStartupLocationAsync(
                         cancellationToken);
 
                 cancellationToken.ThrowIfCancellationRequested();
@@ -2208,15 +3336,25 @@ namespace RescuAR.App.Views.Camera
                     return false;
                 }
 
+                Log.Info(
+                    MldLogTag,
+                    "MLD route-start location selected: " +
+                    $"source={locationSource}, " +
+                    $"diagnosticFallbackBootstrap={usedFallbackBootstrap}, " +
+                    $"accuracy=" +
+                    $"{(locationReading.AccuracyMeters.HasValue ? locationReading.AccuracyMeters.Value.ToString("F1") : "<unknown>")}m, " +
+                    $"age=" +
+                    $"{Math.Max(0.0, (DateTimeOffset.UtcNow - locationReading.Timestamp).TotalSeconds):F1}s.");
+
                 GeoCoordinate origin =
                     locationReading.Coordinate;
 
                 lock (routeProgressFusionSync)
                 {
-                    latestGpsCoordinateForDeveloperReroute =
+                    latestGpsCoordinateForRouting =
                         locationReading.Coordinate;
 
-                    latestGpsAccuracyForDeveloperReroute =
+                    latestGpsAccuracyForRouting =
                         locationReading.AccuracyMeters;
 
                     latestGpsTimestampForRouting =
@@ -2248,16 +3386,14 @@ namespace RescuAR.App.Views.Camera
                     return false;
                 }
 
-                Log.Debug(
+                LogDetailedDebug(
                     MldLogTag,
                     "MLD route inputs ready: " +
-                    $"origin=({origin.Latitude:F7},{origin.Longitude:F7}), " +
-                    $"destination='{destination.Name}', " +
-                    $"destinationCoord=(" +
-                    $"{destination.Coordinate.Latitude:F7}," +
-                    $"{destination.Coordinate.Longitude:F7})");
+                    $"origin={DiagnosticPrivacyPolicy.FormatCoordinate(origin.Latitude, origin.Longitude)}, " +
+                    $"destination='{DiagnosticPrivacyPolicy.FormatRouteLabel(destination.Name)}', " +
+                    $"destinationCoordinate={DiagnosticPrivacyPolicy.FormatCoordinate(destination.Coordinate.Latitude, destination.Coordinate.Longitude)}");
 
-                Log.Debug(
+                LogDetailedDebug(
                     HeadingLogTag,
                     _headingAlignmentService.HasSessionCalibration
                         ? "GPS origin acquired. Reusing retained ARCore-session heading alignment."
@@ -2283,7 +3419,7 @@ namespace RescuAR.App.Views.Camera
                         headingAlignment.Value
                             .MapToArYawDegrees;
 
-                    Log.Debug(
+                    LogDetailedDebug(
                         HeadingLogTag,
                         "Applying heading calibration to MLD route: " +
                         $"mapToArYaw={mapToArYawDegrees:F2} deg, " +
@@ -2374,12 +3510,11 @@ namespace RescuAR.App.Views.Camera
 
                 _headingRevalidationPolicy.Reset();
 
-                UpdateTurnGuidance(
-                    route);
+                UpdateTurnGuidance();
 
                 StartRouteProgress();
 
-                Log.Debug(
+                LogDetailedDebug(
                     MldLogTag,
                     "Navigation route request COMPLETE: " +
                     $"algorithm='{route.Algorithm}', " +
@@ -2396,7 +3531,7 @@ namespace RescuAR.App.Views.Camera
             }
             catch (OperationCanceledException)
             {
-                Log.Debug(
+                LogDetailedDebug(
                     MldLogTag,
                     "MLD route request cancelled.");
 
@@ -2419,6 +3554,248 @@ namespace RescuAR.App.Views.Camera
             await Task.CompletedTask;
             return false;
 #endif
+        }
+
+        private void OnLowLightFlashlightClicked(
+            object? sender,
+            EventArgs e)
+        {
+            OnCameraFlashlightClicked(
+                sender,
+                null!);
+        }
+
+        private async void OnLowLightMapClicked(
+            object? sender,
+            EventArgs e)
+        {
+            if (Shell.Current is not null)
+            {
+                await Shell.Current.GoToAsync(
+                    "//Map");
+            }
+        }
+
+        private async Task<(
+            LocationReading? Reading,
+            string Source,
+            bool UsedFallbackBootstrap)>
+            ResolveRouteStartupLocationAsync(
+                CancellationToken cancellationToken)
+        {
+            LocationReading? cached =
+                null;
+
+            bool cachedAccepted =
+                false;
+
+            TimeSpan cachedAge =
+                TimeSpan.MaxValue;
+
+            if (EnableDiagnosticRouteVisibilityOverride)
+            {
+                cached =
+                    await _locationService.GetLastKnownLocationAsync(
+                        cancellationToken);
+
+                cachedAccepted =
+                    IsFallbackBootstrapLocationAcceptable(
+                        cached,
+                        out cachedAge);
+
+#if ANDROID
+                if (cached is not null)
+                {
+                    LogDetailedDebug(
+                        MldLogTag,
+                        "Diagnostic route-start cache evaluated: " +
+                        $"accepted={cachedAccepted}, " +
+                        $"accuracy=" +
+                        $"{(cached.AccuracyMeters.HasValue ? cached.AccuracyMeters.Value.ToString("F1") : "<unknown>")}m, " +
+                        $"age={Math.Max(0.0, cachedAge.TotalSeconds):F1}s, " +
+                        $"limits={FallbackBootstrapLocationMaximumAccuracyMeters:F0}m/" +
+                        $"{FallbackBootstrapLocationMaximumAge.TotalSeconds:F0}s.");
+                }
+#endif
+            }
+
+            using CancellationTokenSource freshLocationCancellation =
+                CancellationTokenSource.CreateLinkedTokenSource(
+                    cancellationToken);
+
+            Task<LocationReading?> freshLocationTask =
+                _locationService.GetCurrentLocationAsync(
+                    freshLocationCancellation.Token);
+
+            Task startupBudget =
+                Task.Delay(
+                    RouteStartupFreshLocationBudgetMilliseconds,
+                    cancellationToken);
+
+            Task completed =
+                await Task.WhenAny(
+                    freshLocationTask,
+                    startupBudget);
+
+            cancellationToken.ThrowIfCancellationRequested();
+
+            if (completed ==
+                freshLocationTask)
+            {
+                LocationReading? fresh =
+                    await freshLocationTask;
+
+                bool freshCoordinateValid =
+                    fresh is not null &&
+                    fresh.Coordinate.IsValid;
+
+                bool freshAccuracyAcceptable =
+                    freshCoordinateValid &&
+                    (!fresh!.AccuracyMeters.HasValue ||
+                     fresh.AccuracyMeters.Value <=
+                        RouteStartupFreshLocationMaximumAccuracyMeters);
+
+                bool strictCacheSaferThanFresh =
+                    cachedAccepted &&
+                    IsDiagnosticFallbackCacheSaferThanFresh(
+                        cached!,
+                        fresh);
+
+                if (!strictCacheSaferThanFresh &&
+                    (freshAccuracyAcceptable ||
+                     !cachedAccepted))
+                {
+                    return (
+                        fresh,
+                        "CURRENT",
+                        false);
+                }
+
+#if ANDROID
+                if (strictCacheSaferThanFresh)
+                {
+                    string freshAccuracyText =
+                        fresh?.AccuracyMeters is double freshAccuracy
+                            ? freshAccuracy.ToString(
+                                "F1")
+                            : "<unknown>";
+
+                    Log.Warn(
+                        MldLogTag,
+                        "DIAGNOSTIC ROUTE STARTUP QUALITY FALLBACK: " +
+                        $"strictCacheAccuracy={cached!.AccuracyMeters!.Value:F1}m, " +
+                        $"freshAccuracy={freshAccuracyText}m. " +
+                        "Using the materially safer cached origin for initial " +
+                        "geometry only; route-progress safety remains unchanged.");
+                }
+#endif
+
+                return (
+                    cached,
+                    "LAST_KNOWN_STRICT",
+                    true);
+            }
+
+            if (!cachedAccepted)
+            {
+#if ANDROID
+                LogDetailedDebug(
+                    MldLogTag,
+                    "Fresh GPS exceeded the diagnostic startup budget, " +
+                    "but no safe cached fix exists. Preserving the original " +
+                    "fresh-location wait.");
+#endif
+
+                LocationReading? fresh =
+                    await freshLocationTask;
+
+                return (
+                    fresh,
+                    "CURRENT_DELAYED",
+                    false);
+            }
+
+            freshLocationCancellation.Cancel();
+
+            try
+            {
+                await freshLocationTask;
+            }
+            catch (OperationCanceledException)
+                when (!cancellationToken.IsCancellationRequested)
+            {
+                // Expected: the strict cached fix won the bounded startup race.
+            }
+
+#if ANDROID
+            Log.Warn(
+                MldLogTag,
+                "DIAGNOSTIC ROUTE STARTUP FALLBACK: fresh GPS exceeded " +
+                $"{RouteStartupFreshLocationBudgetMilliseconds}ms; using a " +
+                "strict recent cached fix for initial route geometry. GPS/PDR " +
+                "progress, connector, and reroute validation remain unchanged.");
+#endif
+
+            return (
+                cached,
+                "LAST_KNOWN_STRICT",
+                true);
+        }
+
+        private static bool IsFallbackBootstrapLocationAcceptable(
+            LocationReading? reading,
+            out TimeSpan age)
+        {
+            age =
+                TimeSpan.MaxValue;
+
+            if (reading is null ||
+                !reading.Coordinate.IsValid ||
+                !reading.AccuracyMeters.HasValue ||
+                !double.IsFinite(
+                    reading.AccuracyMeters.Value) ||
+                reading.AccuracyMeters.Value <
+                    0.0 ||
+                reading.AccuracyMeters.Value >
+                    FallbackBootstrapLocationMaximumAccuracyMeters)
+            {
+                return false;
+            }
+
+            age =
+                DateTimeOffset.UtcNow -
+                    reading.Timestamp;
+
+            return age >=
+                    TimeSpan.FromSeconds(
+                        -2) &&
+                age <=
+                    FallbackBootstrapLocationMaximumAge;
+        }
+
+        private static bool IsDiagnosticFallbackCacheSaferThanFresh(
+            LocationReading cached,
+            LocationReading? fresh)
+        {
+            if (!cached.AccuracyMeters.HasValue)
+            {
+                return false;
+            }
+
+            if (fresh is null ||
+                !fresh.Coordinate.IsValid ||
+                !fresh.AccuracyMeters.HasValue ||
+                !double.IsFinite(
+                    fresh.AccuracyMeters.Value) ||
+                fresh.AccuracyMeters.Value <
+                    0.0)
+            {
+                return true;
+            }
+
+            return fresh.AccuracyMeters.Value -
+                    cached.AccuracyMeters.Value >=
+                FallbackBootstrapFreshAccuracyDisadvantageMeters;
         }
 
         /// <summary>
@@ -2495,7 +3872,7 @@ namespace RescuAR.App.Views.Camera
             }
 
 #if ANDROID
-            Log.Debug(
+            LogDetailedDebug(
                 MldLogTag,
                 $"Cancelling MLD route work: {reason}");
 #endif
@@ -2526,7 +3903,7 @@ namespace RescuAR.App.Views.Camera
                 true;
 
 #if ANDROID
-            Log.Debug(
+            LogDetailedDebug(
                 RerouteLogTag,
                 "Connectivity failover watcher subscribed: " +
                 $"networkAccess={Connectivity.Current.NetworkAccess}.");
@@ -2570,7 +3947,7 @@ namespace RescuAR.App.Views.Camera
                     IsAStarRoute(
                         activeRoute))
                 {
-                    Log.Debug(
+                    LogDetailedDebug(
                         RerouteLogTag,
                         "Internet restored while an offline A* route is active. " +
                         "Keeping the current route; MLD becomes preferred again " +
@@ -2740,7 +4117,7 @@ namespace RescuAR.App.Views.Camera
                 if (Connectivity.Current.NetworkAccess ==
                     NetworkAccess.Internet)
                 {
-                    Log.Debug(
+                    LogDetailedDebug(
                         RerouteLogTag,
                         "Internet recovered before offline replacement began; " +
                         "MLD route retained.");
@@ -2753,8 +4130,8 @@ namespace RescuAR.App.Views.Camera
                     "CONFIRMED NETWORK LOSS: transitioning active navigation " +
                     "from MLD to offline A*. The current MLD AR route will stay " +
                     "visible until the A* replacement is ready. " +
-                    $"origin=({failoverOrigin.Value.Latitude:F7}," +
-                    $"{failoverOrigin.Value.Longitude:F7}), reason='{reason}'.");
+                    $"origin={DiagnosticPrivacyPolicy.FormatCoordinate(failoverOrigin.Value.Latitude, failoverOrigin.Value.Longitude)}, " +
+                    $"reason='{reason}'.");
 
                 bool switched =
                     await TryDynamicRerouteAsync(
@@ -2812,7 +4189,7 @@ namespace RescuAR.App.Views.Camera
             lock (routeProgressFusionSync)
             {
                 recentCoordinate =
-                    latestGpsCoordinateForDeveloperReroute;
+                    latestGpsCoordinateForRouting;
 
                 recentTimestamp =
                     latestGpsTimestampForRouting;
@@ -2827,7 +4204,7 @@ namespace RescuAR.App.Views.Camera
                             15))
             {
 #if ANDROID
-                Log.Debug(
+                LogDetailedDebug(
                     RerouteLogTag,
                     "Using recent GPS route-progress fix as the offline A* " +
                     "failover origin.");
@@ -2849,7 +4226,7 @@ namespace RescuAR.App.Views.Camera
                             30))
             {
 #if ANDROID
-                Log.Debug(
+                LogDetailedDebug(
                     RerouteLogTag,
                     "Using recent last-known GPS fix as the offline A* " +
                     "failover origin.");
@@ -2858,7 +4235,7 @@ namespace RescuAR.App.Views.Camera
             }
 
 #if ANDROID
-            Log.Debug(
+            LogDetailedDebug(
                 RerouteLogTag,
                 "Requesting a fresh GPS fix for the offline A* failover origin.");
 #endif
@@ -2888,7 +4265,7 @@ namespace RescuAR.App.Views.Camera
             }
 
 #if ANDROID
-            Log.Debug(
+            LogDetailedDebug(
                 RerouteLogTag,
                 $"Cancelling pending network-loss failover: {reason}");
 #endif
@@ -2960,10 +4337,10 @@ namespace RescuAR.App.Views.Camera
             NavigationDestinationBridge.DestinationSnapshot destination =
                 NavigationDestinationBridge.Current;
 
-            Log.Debug(
+            LogDetailedDebug(
                 MldLogTag,
                 destination.IsAvailable
-                    ? $"Destination changed while Camera is active: '{destination.Name}'."
+                    ? $"Destination changed while Camera is active: '{DiagnosticPrivacyPolicy.FormatRouteLabel(destination.Name)}'."
                     : "Destination cleared while Camera is active.");
 #endif
 
@@ -2988,8 +4365,10 @@ namespace RescuAR.App.Views.Camera
             activeDestinationSafeZoneRadiusMeters =
                 SafeZoneConfirmationService.ArrivalRadiusMeters;
 
+#if RESCUAR_DIAGNOSTICS
             indoorStationaryPollCount =
                 0;
+#endif
 
             lastPdrHeadingErrorDegrees =
                 null;
@@ -3036,6 +4415,7 @@ namespace RescuAR.App.Views.Camera
 
             _hazardReroutingService.ResetSessionState();
 
+#if RESCUAR_DIAGNOSTICS
             developerHazardValidationArmed =
                 false;
 
@@ -3044,6 +4424,7 @@ namespace RescuAR.App.Views.Camera
                 developerHazardRerouteTestButton.Text =
                     "DEV: Simulate Route Hazard";
             }
+#endif
 
             dynamicRerouteInProgress =
                 false;
@@ -3060,10 +4441,10 @@ namespace RescuAR.App.Views.Camera
             lastRerouteResult =
                 "None";
 
-            latestGpsCoordinateForDeveloperReroute =
+            latestGpsCoordinateForRouting =
                 null;
 
-            latestGpsAccuracyForDeveloperReroute =
+            latestGpsAccuracyForRouting =
                 null;
 
             latestGpsTimestampForRouting =
@@ -3121,7 +4502,7 @@ namespace RescuAR.App.Views.Camera
             if (safeZoneConfirmed)
             {
 #if ANDROID
-                Log.Debug(
+                LogDetailedDebug(
                     SafeZoneLogTag,
                     "Route-progress restart skipped because safe-zone arrival is already confirmed.");
 #endif
@@ -3132,16 +4513,15 @@ namespace RescuAR.App.Views.Camera
                 Connectivity.Current.NetworkAccess ==
                     NetworkAccess.Internet);
 
-            UpdateTurnGuidance(
-                activeRoute);
+            UpdateTurnGuidance();
 
             StartPdrIfPossible();
 
-            if (IndoorRouteTestMode &&
-                FreezeRouteProgressDuringIndoorTest)
+#if RESCUAR_DIAGNOSTICS
+            if (IsIndoorRouteProgressFrozen)
             {
 #if ANDROID
-                Log.Debug(
+                LogDetailedDebug(
                     ProgressLogTag,
                     "Indoor stability mode: GPS/synthetic route progress is " +
                     "intentionally frozen. PDR remains active and may advance " +
@@ -3149,6 +4529,7 @@ namespace RescuAR.App.Views.Camera
 #endif
                 return;
             }
+#endif
 
             routeProgressCancellation =
                 new CancellationTokenSource();
@@ -3161,7 +4542,7 @@ namespace RescuAR.App.Views.Camera
                     cancellationToken);
 
 #if ANDROID
-            Log.Debug(
+            LogDetailedDebug(
                 ProgressLogTag,
                 "GPS route-progress loop started alongside PDR.");
 #endif
@@ -3184,7 +4565,7 @@ namespace RescuAR.App.Views.Camera
 #if ANDROID
                 if (started)
                 {
-                    Log.Debug(
+                    LogDetailedDebug(
                         PdrLogTag,
                         "PDR route-progress input ACTIVE: " +
                         $"baseStepLength={PdrStepLengthMeters:F2} m, " +
@@ -3192,7 +4573,7 @@ namespace RescuAR.App.Views.Camera
                         "directionConfidenceBands=HIGH<=25deg, " +
                         "MEDIUM<=45deg, LOW<=70deg, REJECT>70deg, " +
                         $"gpsFrozen=" +
-                        $"{(IndoorRouteTestMode && FreezeRouteProgressDuringIndoorTest)}.");
+                        $"{IsIndoorRouteProgressFrozen}.");
                 }
 #endif
             }
@@ -3201,7 +4582,7 @@ namespace RescuAR.App.Views.Camera
 #if ANDROID
                 Log.Error(
                     PdrLogTag,
-                    $"PDR step detector failed to start: {exception}");
+                    $"PDR step detector failed to start: {DiagnosticPrivacyPolicy.FormatException(exception)}");
 #endif
             }
         }
@@ -3229,7 +4610,7 @@ namespace RescuAR.App.Views.Camera
             }
 
 #if ANDROID
-            Log.Debug(
+            LogDetailedDebug(
                 ProgressLogTag,
                 $"Stopping GPS route-progress loop: {reason}");
 #endif
@@ -3298,10 +4679,10 @@ namespace RescuAR.App.Views.Camera
                     {
                         lock (routeProgressFusionSync)
                         {
-                            latestGpsCoordinateForDeveloperReroute =
+                            latestGpsCoordinateForRouting =
                                 reading.Coordinate;
 
-                            latestGpsAccuracyForDeveloperReroute =
+                            latestGpsAccuracyForRouting =
                                 reading.AccuracyMeters;
 
                             latestGpsTimestampForRouting =
@@ -3535,6 +4916,7 @@ namespace RescuAR.App.Views.Camera
                                 double safeZoneEvaluationRemainingMeters =
                                     afterGps.RemainingMeters;
 
+#if RESCUAR_DIAGNOSTICS
                                 if (EnableDeveloperSafeZoneValidation &&
                                     developerSafeZoneValidationArmed &&
                                     developerSafeZoneTargetCoordinate.HasValue &&
@@ -3559,6 +4941,7 @@ namespace RescuAR.App.Views.Camera
                                             developerSafeZoneTargetProgressMeters -
                                             afterGps.CommittedProgressMeters);
                                 }
+#endif
 
                                 SafeZoneConfirmationService.SafeZoneDecision decision =
                                     _safeZoneConfirmationService.Evaluate(
@@ -3616,8 +4999,7 @@ namespace RescuAR.App.Views.Camera
                              turnGuidanceUpdate.HasValue) &&
                             !safeZoneConfirmed)
                         {
-                            UpdateTurnGuidance(
-                                route);
+                            UpdateTurnGuidance();
                         }
 
                         bool hazardRerouteOwnsThisCycle =
@@ -3651,6 +5033,7 @@ namespace RescuAR.App.Views.Camera
                                 rerouteReason);
                         }
 
+#if RESCUAR_DIAGNOSTICS
                         if (publishedRealProgress)
                         {
                             indoorStationaryPollCount =
@@ -3660,7 +5043,9 @@ namespace RescuAR.App.Views.Camera
                         {
                             indoorStationaryPollCount++;
                         }
+#endif
                     }
+#if RESCUAR_DIAGNOSTICS
                     else if (IndoorRouteTestMode)
                     {
                         indoorStationaryPollCount++;
@@ -3708,6 +5093,7 @@ namespace RescuAR.App.Views.Camera
                             }
                         }
                     }
+#endif
 
                     await Task.Delay(
                         RouteProgressPollInterval,
@@ -3723,19 +5109,20 @@ namespace RescuAR.App.Views.Camera
 #if ANDROID
                 Log.Error(
                     ProgressLogTag,
-                    $"GPS route-progress loop failed: {exception}");
+                    $"GPS route-progress loop failed: {DiagnosticPrivacyPolicy.FormatException(exception)}");
 #endif
             }
             finally
             {
 #if ANDROID
-                Log.Debug(
+                LogDetailedDebug(
                     ProgressLogTag,
                     "GPS route-progress loop exited.");
 #endif
             }
         }
 
+#if RESCUAR_DIAGNOSTICS
         private void OnDeveloperTurnTestClicked(
             object? sender,
             EventArgs e)
@@ -3868,7 +5255,7 @@ namespace RescuAR.App.Views.Camera
             {
                 Log.Error(
                     TurnLogTag,
-                    $"[DEV TURN] Classifier validation failed: {exception}");
+                    $"[DEV TURN] Classifier validation failed: {DiagnosticPrivacyPolicy.FormatException(exception)}");
             }
             finally
             {
@@ -4022,7 +5409,9 @@ namespace RescuAR.App.Views.Camera
             PedestrianTurnGuidanceService.TurnInstruction ExpectedInstruction,
             double TurnAngleDegrees,
             bool ArrivalCase);
+#endif
 
+#if RESCUAR_DIAGNOSTICS
         private async void OnDeveloperRerouteTestClicked(
             object? sender,
             EventArgs e)
@@ -4067,10 +5456,10 @@ namespace RescuAR.App.Views.Camera
                 lock (routeProgressFusionSync)
                 {
                     realOrigin =
-                        latestGpsCoordinateForDeveloperReroute;
+                        latestGpsCoordinateForRouting;
 
                     realAccuracy =
-                        latestGpsAccuracyForDeveloperReroute;
+                        latestGpsAccuracyForRouting;
 
                     if (!realOrigin.HasValue ||
                         !realOrigin.Value.IsValid)
@@ -4144,7 +5533,7 @@ namespace RescuAR.App.Views.Camera
                 Log.Warn(
                     RerouteLogTag,
                     "[DEV SIM] 3/3 CONFIRMED. Starting REAL Railway reroute from latest GPS origin: " +
-                    $"({realOrigin.Value.Latitude:F7},{realOrigin.Value.Longitude:F7}). " +
+                    $"{DiagnosticPrivacyPolicy.FormatCoordinate(realOrigin.Value.Latitude, realOrigin.Value.Longitude)}. " +
                     "Only the confirmation is simulated; network routing and AR replacement publication are real.");
 
                 await TryDynamicRerouteAsync(
@@ -4158,7 +5547,7 @@ namespace RescuAR.App.Views.Camera
 
                 Log.Error(
                     RerouteLogTag,
-                    $"[DEV SIM] Reroute simulation FAILED: {exception}");
+                    $"[DEV SIM] Reroute simulation FAILED: {DiagnosticPrivacyPolicy.FormatException(exception)}");
             }
             finally
             {
@@ -4169,6 +5558,7 @@ namespace RescuAR.App.Views.Camera
             await Task.CompletedTask;
 #endif
         }
+#endif
 
         private bool StartHazardRerouteIfNeeded(
             RouteResult route,
@@ -4206,7 +5596,7 @@ namespace RescuAR.App.Views.Camera
             if (dynamicRerouteInProgress ||
                 routeRequestInProgress)
             {
-                Log.Debug(
+                LogDetailedDebug(
                     HazardRerouteLogTag,
                     "Unsafe route is already known, but another route operation " +
                     "is active. Hazard-aware rerouting owns this GPS cycle and " +
@@ -4219,10 +5609,10 @@ namespace RescuAR.App.Views.Camera
                     hazard,
                     out string reservationReason))
             {
-                Log.Debug(
+                LogDetailedDebug(
                     HazardRerouteLogTag,
                     "Hazard reroute not repeated yet: " +
-                    $"id='{hazard.Id}', reason='{reservationReason}'.");
+                    $"id='{DiagnosticPrivacyPolicy.FormatRouteLabel(hazard.Id)}', reason='{reservationReason}'.");
 
                 return true;
             }
@@ -4230,7 +5620,7 @@ namespace RescuAR.App.Views.Camera
             Log.Warn(
                 HazardRerouteLogTag,
                 "HAZARD-DRIVEN REROUTE TRIGGERED: " +
-                $"id='{hazard.Id}', " +
+                $"id='{DiagnosticPrivacyPolicy.FormatRouteLabel(hazard.Id)}', " +
                 $"category='{hazard.Category}', " +
                 $"severity='{hazard.Severity}', " +
                 $"distanceAhead={assessment.DistanceAheadMeters:F1} m, " +
@@ -4253,6 +5643,7 @@ namespace RescuAR.App.Views.Camera
 #endif
         }
 
+#if RESCUAR_DIAGNOSTICS
         private void OnDeveloperHazardRerouteTestClicked(
             object? sender,
             EventArgs e)
@@ -4361,10 +5752,10 @@ namespace RescuAR.App.Views.Camera
 
             lock (routeProgressFusionSync)
             {
-                if (latestGpsCoordinateForDeveloperReroute.HasValue)
+                if (latestGpsCoordinateForRouting.HasValue)
                 {
                     rerouteOrigin =
-                        latestGpsCoordinateForDeveloperReroute.Value;
+                        latestGpsCoordinateForRouting.Value;
                 }
             }
 
@@ -4387,7 +5778,7 @@ namespace RescuAR.App.Views.Camera
                 "[DEV HAZARD] ARMED on current route: " +
                 $"currentProgress={progress.CommittedProgressMeters:F1} m, " +
                 $"hazardAhead={DeveloperHazardAheadMeters:F1} m, " +
-                $"hazard=({hazardCoordinate.Latitude:F7},{hazardCoordinate.Longitude:F7}), " +
+                $"hazard={DiagnosticPrivacyPolicy.FormatCoordinate(hazardCoordinate.Latitude, hazardCoordinate.Longitude)}, " +
                 $"radius={DeveloperHazardRadiusMeters:F1} m. " +
                 "Route/hazard detection and provider-aware avoidance remain production logic.");
 
@@ -4397,6 +5788,7 @@ namespace RescuAR.App.Views.Camera
                 rerouteOrigin);
 #endif
         }
+#endif
 
         private void StartDynamicRerouteIfPossible(
             GeoCoordinate origin,
@@ -4414,7 +5806,7 @@ namespace RescuAR.App.Views.Camera
             if (dynamicRerouteInProgress ||
                 routeRequestInProgress)
             {
-                Log.Debug(
+                LogDetailedDebug(
                     RerouteLogTag,
                     "Dynamic reroute trigger ignored because route work is already active.");
 
@@ -4477,8 +5869,8 @@ namespace RescuAR.App.Views.Camera
                     RerouteLogTag,
                     "DYNAMIC REROUTE STARTED: " +
                     $"reason='{reason}', " +
-                    $"origin=({origin.Latitude:F7},{origin.Longitude:F7}), " +
-                    $"destination='{destinationName}'. " +
+                    $"origin={DiagnosticPrivacyPolicy.FormatCoordinate(origin.Latitude, origin.Longitude)}, " +
+                    $"destination='{DiagnosticPrivacyPolicy.FormatRouteLabel(destinationName)}'. " +
                     "The current AR route remains visible until a replacement route is ready.");
 
                 if (hazardAware &&
@@ -4547,7 +5939,7 @@ namespace RescuAR.App.Views.Camera
                     lastRerouteResult =
                         "DestinationChanged";
 
-                    Log.Debug(
+                    LogDetailedDebug(
                         RerouteLogTag,
                         "Dynamic reroute discarded because the navigation destination changed.");
 
@@ -4672,7 +6064,7 @@ namespace RescuAR.App.Views.Camera
                     lastRerouteResult =
                         "DestinationChanged";
 
-                    Log.Debug(
+                    LogDetailedDebug(
                         RerouteLogTag,
                         "Dynamic reroute discarded because the destination changed before atomic route publication.");
 
@@ -4715,8 +6107,7 @@ namespace RescuAR.App.Views.Camera
                     return false;
                 }
 
-                UpdateTurnGuidance(
-                    replacementRoute);
+                UpdateTurnGuidance();
 
                 lastRerouteResult =
                     hazardAware
@@ -4752,7 +6143,7 @@ namespace RescuAR.App.Views.Camera
                 lastRerouteResult =
                     "Cancelled";
 
-                Log.Debug(
+                LogDetailedDebug(
                     RerouteLogTag,
                     "Dynamic reroute cancelled.");
 
@@ -4765,7 +6156,7 @@ namespace RescuAR.App.Views.Camera
 
                 Log.Error(
                     RerouteLogTag,
-                    $"Dynamic reroute FAILED: {exception}");
+                    $"Dynamic reroute FAILED: {DiagnosticPrivacyPolicy.FormatException(exception)}");
 
                 return false;
             }
@@ -4808,30 +6199,70 @@ namespace RescuAR.App.Views.Camera
 #endif
         }
 
-        private void UpdateTurnGuidance(
-            RouteResult route)
+        private void UpdateTurnGuidance()
         {
-            ARRouteBridge.RouteSnapshot visibleRoute =
-                ARRouteBridge.Current;
+            RouteResult? acceptedRoute;
+
+            RouteProgressTracker.ProgressSnapshot acceptedProgress;
+
+            ARRouteBridge.RouteSnapshot visibleRoute;
+
+            /*
+             * Capture the accepted geographic route, its matched progress, and
+             * the currently displayed AR route under the same outer lock used
+             * by route replacement and GPS/PDR fusion. Turn geometry stays tied
+             * to the visible AR window, while the displayed total remaining
+             * distance comes only from accepted tracker progress.
+             */
+            lock (routeProgressFusionSync)
+            {
+                acceptedRoute =
+                    activeRoute;
+
+                acceptedProgress =
+                    _routeProgressTracker.Current;
+
+                visibleRoute =
+                    ARRouteBridge.Current;
+            }
 
             RouteNavigationState navigationState =
                 visibleRoute.NavigationState;
 
-            if (!visibleRoute.IsAvailable ||
+            bool visibleRouteMatchesAcceptedRoute =
+                acceptedRoute is not null &&
+                string.Equals(
+                    visibleRoute.Algorithm,
+                    acceptedRoute.Algorithm,
+                    StringComparison.Ordinal) &&
+                double.IsFinite(
+                    visibleRoute.TotalDistanceMeters) &&
+                double.IsFinite(
+                    acceptedRoute.TotalDistanceMeters) &&
+                Math.Abs(
+                    visibleRoute.TotalDistanceMeters -
+                    acceptedRoute.TotalDistanceMeters) <=
+                        0.50;
+
+            if (acceptedRoute is null ||
+                !acceptedProgress.HasRoute ||
+                !visibleRoute.IsAvailable ||
+                !visibleRouteMatchesAcceptedRoute ||
                 !navigationState.IsAvailable ||
                 navigationState.VisualKind !=
                     RouteVisualKind.RouteWindow)
             {
-                lastTurnGuidance =
-                    PedestrianTurnGuidanceService.TurnGuidanceSnapshot.Unavailable;
+                ResetTurnGuidance();
 
 #if ANDROID
-                Log.Debug(
+                LogDetailedDebug(
                     TurnLogTag,
                     "TURN GUIDANCE HELD: visible AR geometry is not a " +
-                    "validated route-progress window. " +
+                    "validated window for the accepted route/progress state. " +
                     $"routeVersion={visibleRoute.Version}, " +
-                    $"visualKind={navigationState.VisualKind}.");
+                    $"visualKind={navigationState.VisualKind}, " +
+                    $"routeMatches={visibleRouteMatchesAcceptedRoute}, " +
+                    $"acceptedProgress={acceptedProgress.HasRoute}.");
 #endif
 
                 Dispatcher.Dispatch(
@@ -4844,14 +6275,79 @@ namespace RescuAR.App.Views.Camera
                 return;
             }
 
-            PedestrianTurnGuidanceService.TurnGuidanceSnapshot guidance =
+            PedestrianTurnGuidanceService.TurnGuidanceSnapshot mapGuidance =
                 _turnGuidanceService.Evaluate(
-                    route,
+                    acceptedRoute,
                     navigationState.WindowStartProgressMeters,
                     navigationState.SourceSegmentIndex);
 
-            lastTurnGuidance =
-                guidance;
+            if (mapGuidance.IsAvailable)
+            {
+                mapGuidance =
+                    mapGuidance with
+                    {
+                        RemainingRouteMeters =
+                            Math.Max(
+                                0.0,
+                                acceptedProgress.RemainingMeters)
+                    };
+            }
+
+            PedestrianTurnGuidanceService.VisibleTurnGuidanceSnapshot
+                visibleGuidance =
+                    _turnGuidanceService.EvaluateVisibleRoute(
+                        visibleRoute.Points);
+
+            bool cameraHeadingAvailable =
+                TryGetCameraToVisibleRouteHeading(
+                    visibleRoute,
+                    out double cameraToRouteHeadingDegrees);
+
+            bool cameraAligned;
+
+            string consolidationReason;
+
+            PedestrianTurnGuidanceService.TurnGuidanceSnapshot guidance;
+
+            lock (turnGuidanceSync)
+            {
+                lastVisibleTurnGuidance =
+                    visibleGuidance;
+
+                lastCameraToRouteHeadingDegrees =
+                    cameraHeadingAvailable
+                        ? cameraToRouteHeadingDegrees
+                        : null;
+
+                cameraAligned =
+                    UpdateCameraRouteAlignment(
+                        cameraHeadingAvailable,
+                        cameraToRouteHeadingDegrees);
+
+                guidance =
+                    ConsolidateTurnGuidance(
+                        mapGuidance,
+                        visibleGuidance,
+                        cameraHeadingAvailable,
+                        cameraToRouteHeadingDegrees,
+                        cameraAligned,
+                        out consolidationReason);
+
+                guidance =
+                    StabilizeTurnGuidance(
+                        guidance,
+                        consolidationReason,
+                        out string stabilizedReason);
+
+                consolidationReason =
+                    stabilizedReason;
+
+                lastTurnGuidanceConsolidationReason =
+                    consolidationReason;
+
+                lastTurnGuidance =
+                    guidance;
+            }
 
             int distanceBucket =
                 guidance.IsAvailable &&
@@ -4863,24 +6359,50 @@ namespace RescuAR.App.Views.Camera
                     : -1;
 
 #if ANDROID
+            string consolidationSignature =
+                $"{mapGuidance.Instruction}|" +
+                $"{GetDistanceBucket(mapGuidance.DistanceToTurnMeters)}|" +
+                $"{visibleGuidance.Instruction}|" +
+                $"{GetDistanceBucket(visibleGuidance.DistanceToTurnMeters)}|" +
+                $"{guidance.Instruction}|" +
+                $"{distanceBucket}|" +
+                $"{(cameraHeadingAvailable ? Math.Round(cameraToRouteHeadingDegrees / 5.0) : double.NaN)}|" +
+                consolidationReason;
+
             if (guidance.IsAvailable &&
-                (guidance.Instruction !=
-                    lastLoggedTurnInstruction ||
-                 distanceBucket !=
-                    lastLoggedTurnDistanceBucket))
+                !string.Equals(
+                    consolidationSignature,
+                    lastLoggedTurnConsolidationSignature,
+                    StringComparison.Ordinal))
             {
-                Log.Debug(
+                LogDetailedDebug(
                     TurnLogTag,
-                    "TURN GUIDANCE: " +
-                    $"instruction={guidance.Instruction}, " +
-                    $"text='{guidance.DisplayText}', " +
-                    $"distanceToTurn=" +
-                    $"{(double.IsFinite(guidance.DistanceToTurnMeters) ? guidance.DistanceToTurnMeters.ToString("F1") : "<none>")} m, " +
-                    $"turnAngle={guidance.TurnAngleDegrees:F1} deg, " +
+                    "TURN GUIDANCE CONSOLIDATED: " +
+                    $"mapInstruction={mapGuidance.Instruction}, " +
+                    $"mapDistance=" +
+                    $"{(double.IsFinite(mapGuidance.DistanceToTurnMeters) ? mapGuidance.DistanceToTurnMeters.ToString("F1") : "<none>")} m, " +
+                    $"mapAngle={mapGuidance.TurnAngleDegrees:F1} deg, " +
+                    $"cyanInstruction={visibleGuidance.Instruction}, " +
+                    $"cyanDistance=" +
+                    $"{(double.IsFinite(visibleGuidance.DistanceToTurnMeters) ? visibleGuidance.DistanceToTurnMeters.ToString("F1") : "<none>")} m, " +
+                    $"cyanAngle={visibleGuidance.TurnAngleDegrees:F1} deg, " +
+                    $"cyanHorizon={visibleGuidance.VisibleHorizonMeters:F1} m, " +
+                    $"cameraToRoute=" +
+                    $"{(cameraHeadingAvailable ? cameraToRouteHeadingDegrees.ToString("F1") : "<unavailable>")} deg, " +
+                    $"cameraAligned={cameraAligned}, " +
+                    $"finalInstruction={guidance.Instruction}, " +
+                    $"finalText='{guidance.DisplayText}', " +
+                    $"reason='{consolidationReason}', " +
                     $"remaining={guidance.RemainingRouteMeters:F1} m, " +
-                    $"progress={navigationState.WindowStartProgressMeters:F1} m, " +
+                    $"visualProgress={navigationState.WindowStartProgressMeters:F1} m, " +
+                    $"acceptedProgress={acceptedProgress.CommittedProgressMeters:F1} m, " +
+                    $"publicationLag=" +
+                    $"{Math.Max(0.0, acceptedProgress.CommittedProgressMeters - navigationState.WindowStartProgressMeters):F1} m, " +
                     $"sourceSegment={navigationState.SourceSegmentIndex}, " +
                     $"routeVersion={visibleRoute.Version}");
+
+                lastLoggedTurnConsolidationSignature =
+                    consolidationSignature;
 
                 lastLoggedTurnInstruction =
                     guidance.Instruction;
@@ -4913,6 +6435,564 @@ namespace RescuAR.App.Views.Camera
                 });
         }
 
+        private PedestrianTurnGuidanceService.TurnGuidanceSnapshot
+            ConsolidateTurnGuidance(
+                PedestrianTurnGuidanceService.TurnGuidanceSnapshot
+                    mapGuidance,
+                PedestrianTurnGuidanceService.VisibleTurnGuidanceSnapshot
+                    visibleGuidance,
+                bool cameraHeadingAvailable,
+                double cameraToRouteHeadingDegrees,
+                bool cameraAligned,
+                out string reason)
+        {
+            if (!mapGuidance.IsAvailable ||
+                !visibleGuidance.IsAvailable)
+            {
+                reason =
+                    "MAP_OR_CYAN_GUIDANCE_UNAVAILABLE";
+
+                return PedestrianTurnGuidanceService
+                    .TurnGuidanceSnapshot
+                    .Unavailable;
+            }
+
+            if (mapGuidance.Instruction ==
+                PedestrianTurnGuidanceService.TurnInstruction.Arrive)
+            {
+                reason =
+                    "ARRIVAL_FROM_ACCEPTED_ROUTE";
+
+                return mapGuidance;
+            }
+
+            TurnGuidanceFamily mapFamily =
+                GetTurnGuidanceFamily(
+                    mapGuidance.Instruction);
+
+            TurnGuidanceFamily visibleFamily =
+                GetTurnGuidanceFamily(
+                    visibleGuidance.Instruction);
+
+            bool mapTurnBeyondVisibleWindow =
+                IsDirectionalTurnInstruction(
+                    mapGuidance.Instruction) &&
+                double.IsFinite(
+                    mapGuidance.DistanceToTurnMeters) &&
+                double.IsFinite(
+                    visibleGuidance.VisibleHorizonMeters) &&
+                mapGuidance.DistanceToTurnMeters >
+                    visibleGuidance.VisibleHorizonMeters +
+                        2.0;
+
+            bool mapHasTurn =
+                mapFamily ==
+                    TurnGuidanceFamily.Left ||
+                mapFamily ==
+                    TurnGuidanceFamily.Right ||
+                mapFamily ==
+                    TurnGuidanceFamily.UTurn;
+
+            bool visibleHasTurn =
+                visibleFamily ==
+                    TurnGuidanceFamily.Left ||
+                visibleFamily ==
+                    TurnGuidanceFamily.Right ||
+                visibleFamily ==
+                    TurnGuidanceFamily.UTurn;
+
+            bool turnDistancesAgree =
+                mapHasTurn &&
+                visibleHasTurn &&
+                double.IsFinite(
+                    mapGuidance.DistanceToTurnMeters) &&
+                double.IsFinite(
+                    visibleGuidance.DistanceToTurnMeters) &&
+                Math.Abs(
+                    mapGuidance.DistanceToTurnMeters -
+                        visibleGuidance.DistanceToTurnMeters) <=
+                            7.5;
+
+            if (mapTurnBeyondVisibleWindow &&
+                visibleFamily ==
+                    TurnGuidanceFamily.Straight)
+            {
+                if (!cameraAligned)
+                {
+                    reason =
+                        cameraHeadingAvailable
+                            ? "CAMERA_NOT_ALIGNED_WITH_CYAN_ENTRY"
+                            : "CAMERA_HEADING_UNAVAILABLE";
+
+                    return CreateFollowCyanRouteGuidance(
+                        mapGuidance,
+                        cameraHeadingAvailable,
+                        cameraToRouteHeadingDegrees);
+                }
+
+                reason =
+                    "MAP_TURN_BEYOND_CYAN_WINDOW";
+
+                return mapGuidance;
+            }
+
+            if (mapHasTurn &&
+                visibleHasTurn &&
+                mapFamily ==
+                    visibleFamily &&
+                turnDistancesAgree)
+            {
+                if (!cameraAligned)
+                {
+                    reason =
+                        cameraHeadingAvailable
+                            ? "CAMERA_NOT_ALIGNED_WITH_CYAN_ENTRY"
+                            : "CAMERA_HEADING_UNAVAILABLE";
+
+                    return CreateFollowCyanRouteGuidance(
+                        mapGuidance,
+                        cameraHeadingAvailable,
+                        cameraToRouteHeadingDegrees);
+                }
+
+                reason =
+                    "MAP_AND_CYAN_TURN_AGREE";
+
+                return new PedestrianTurnGuidanceService.TurnGuidanceSnapshot(
+                    true,
+                    visibleGuidance.Instruction,
+                    visibleGuidance.DistanceToTurnMeters,
+                    visibleGuidance.TurnAngleDegrees,
+                    mapGuidance.RemainingRouteMeters,
+                    mapGuidance.DisplayText);
+            }
+
+            if (mapFamily ==
+                    TurnGuidanceFamily.Straight &&
+                visibleFamily ==
+                    TurnGuidanceFamily.Straight)
+            {
+                if (!cameraAligned)
+                {
+                    reason =
+                        cameraHeadingAvailable
+                            ? "CAMERA_NOT_ALIGNED_WITH_CYAN_ENTRY"
+                            : "CAMERA_HEADING_UNAVAILABLE";
+
+                    return CreateFollowCyanRouteGuidance(
+                        mapGuidance,
+                        cameraHeadingAvailable,
+                        cameraToRouteHeadingDegrees);
+                }
+
+                reason =
+                    "MAP_AND_CYAN_STRAIGHT_AGREE";
+
+                return mapGuidance;
+            }
+
+            reason =
+                mapHasTurn &&
+                visibleHasTurn &&
+                mapFamily ==
+                    visibleFamily &&
+                !turnDistancesAgree
+                    ? "MAP_CYAN_TURN_DISTANCE_DISAGREEMENT"
+                    : $"MAP_CYAN_DISAGREE_{mapFamily}_VS_{visibleFamily}";
+
+            return CreateFollowCyanRouteGuidance(
+                mapGuidance,
+                cameraHeadingAvailable: false,
+                cameraToRouteHeadingDegrees: 0.0);
+        }
+
+        private static PedestrianTurnGuidanceService.TurnGuidanceSnapshot
+            CreateFollowCyanRouteGuidance(
+                PedestrianTurnGuidanceService.TurnGuidanceSnapshot
+                    mapGuidance,
+                bool cameraHeadingAvailable,
+                double cameraToRouteHeadingDegrees)
+        {
+            string displayText =
+                "Follow the cyan route";
+
+            if (cameraHeadingAvailable)
+            {
+                double absoluteAngle =
+                    Math.Abs(
+                        cameraToRouteHeadingDegrees);
+
+                if (absoluteAngle >=
+                    RouteLocatorBehindAngleDegrees)
+                {
+                    displayText =
+                        "Turn around to face the cyan route";
+                }
+                else if (cameraToRouteHeadingDegrees >
+                    CameraRouteAlignmentExitDegrees)
+                {
+                    displayText =
+                        "Face the cyan route — look right";
+                }
+                else if (cameraToRouteHeadingDegrees <
+                    -CameraRouteAlignmentExitDegrees)
+                {
+                    displayText =
+                        "Face the cyan route — look left";
+                }
+            }
+
+            return new PedestrianTurnGuidanceService.TurnGuidanceSnapshot(
+                true,
+                PedestrianTurnGuidanceService.TurnInstruction.FollowRoute,
+                mapGuidance.DistanceToTurnMeters,
+                mapGuidance.TurnAngleDegrees,
+                mapGuidance.RemainingRouteMeters,
+                displayText);
+        }
+
+        private bool UpdateCameraRouteAlignment(
+            bool cameraHeadingAvailable,
+            double cameraToRouteHeadingDegrees)
+        {
+            if (!cameraHeadingAvailable ||
+                !double.IsFinite(
+                    cameraToRouteHeadingDegrees))
+            {
+                cameraAlignedWithVisibleRoute =
+                    false;
+
+                cameraRouteAlignmentInitialized =
+                    false;
+
+                return false;
+            }
+
+            double absoluteAngle =
+                Math.Abs(
+                    cameraToRouteHeadingDegrees);
+
+            if (!cameraRouteAlignmentInitialized)
+            {
+                cameraAlignedWithVisibleRoute =
+                    absoluteAngle <=
+                        CameraRouteAlignmentEnterDegrees;
+
+                cameraRouteAlignmentInitialized =
+                    true;
+
+                return cameraAlignedWithVisibleRoute;
+            }
+
+            if (cameraAlignedWithVisibleRoute)
+            {
+                if (absoluteAngle >
+                    CameraRouteAlignmentExitDegrees)
+                {
+                    cameraAlignedWithVisibleRoute =
+                        false;
+                }
+            }
+            else if (absoluteAngle <=
+                CameraRouteAlignmentEnterDegrees)
+            {
+                cameraAlignedWithVisibleRoute =
+                    true;
+            }
+
+            return cameraAlignedWithVisibleRoute;
+        }
+
+        private static bool TryGetCameraToVisibleRouteHeading(
+            ARRouteBridge.RouteSnapshot route,
+            out double signedAngleDegrees)
+        {
+            signedAngleDegrees =
+                0.0;
+
+            ARCameraPoseBridge.SpatialSnapshot spatial =
+                ARCameraPoseBridge.CurrentFrame;
+
+            ARTrackingStateBridge.TrackingSnapshot tracking =
+                ARTrackingStateBridge.Current;
+
+            if (!route.IsAvailable ||
+                route.Points.Count <
+                    2 ||
+                !ARRenderGenerationBridge.IsCurrentSession(
+                    route.Generation) ||
+                !spatial.IsFresh ||
+                !spatial.IsTracking ||
+                !spatial.Pose.IsTracking ||
+                !ARRenderGenerationBridge.IsCurrent(
+                    spatial.Generation) ||
+                route.Generation.SessionGeneration !=
+                    spatial.Generation.SessionGeneration ||
+                !tracking.IsRenderableFor(
+                    spatial.Generation.SessionGeneration))
+            {
+                return false;
+            }
+
+            Quaternion rotation =
+                new(
+                    spatial.Pose.RotationX,
+                    spatial.Pose.RotationY,
+                    spatial.Pose.RotationZ,
+                    spatial.Pose.RotationW);
+
+            float lengthSquared =
+                rotation.LengthSquared();
+
+            if (!float.IsFinite(
+                    lengthSquared) ||
+                lengthSquared <
+                    0.0001f)
+            {
+                return false;
+            }
+
+            rotation =
+                Quaternion.Normalize(
+                    rotation);
+
+            Vector3 cameraForward =
+                Vector3.Transform(
+                    new Vector3(
+                        0.0f,
+                        0.0f,
+                        -1.0f),
+                    rotation);
+
+            double cameraMagnitude =
+                Math.Sqrt(
+                    cameraForward.X *
+                        cameraForward.X +
+                    cameraForward.Z *
+                        cameraForward.Z);
+
+            if (!double.IsFinite(
+                    cameraMagnitude) ||
+                cameraMagnitude <
+                    0.10)
+            {
+                return false;
+            }
+
+            ArHorizontalRoutePoint routeStart =
+                route.Points[0];
+
+            double routeDeltaX =
+                0.0;
+
+            double routeDeltaZ =
+                0.0;
+
+            bool routeTangentAvailable =
+                false;
+
+            for (int i = 1;
+                 i < route.Points.Count;
+                 i++)
+            {
+                routeDeltaX =
+                    route.Points[i].X -
+                        routeStart.X;
+
+                routeDeltaZ =
+                    route.Points[i].Z -
+                        routeStart.Z;
+
+                double tangentLength =
+                    Math.Sqrt(
+                        routeDeltaX *
+                            routeDeltaX +
+                        routeDeltaZ *
+                            routeDeltaZ);
+
+                if (double.IsFinite(
+                        tangentLength) &&
+                    tangentLength >=
+                        2.0)
+                {
+                    routeTangentAvailable =
+                        true;
+
+                    break;
+                }
+            }
+
+            if (!routeTangentAvailable)
+            {
+                return false;
+            }
+
+            double cameraAzimuthDegrees =
+                Normalize360Degrees(
+                    RadiansToDegrees(
+                        Math.Atan2(
+                            cameraForward.X,
+                            cameraForward.Z)));
+
+            double routeAzimuthDegrees =
+                Normalize360Degrees(
+                    RadiansToDegrees(
+                        Math.Atan2(
+                            routeDeltaX,
+                            routeDeltaZ)));
+
+            signedAngleDegrees =
+                NormalizeSignedDegrees(
+                    routeAzimuthDegrees -
+                        cameraAzimuthDegrees);
+
+            return double.IsFinite(
+                signedAngleDegrees);
+        }
+
+        private PedestrianTurnGuidanceService.TurnGuidanceSnapshot
+            StabilizeTurnGuidance(
+                PedestrianTurnGuidanceService.TurnGuidanceSnapshot candidate,
+                string candidateReason,
+                out string stabilizedReason)
+        {
+            stabilizedReason =
+                candidateReason;
+
+            if (!candidate.IsAvailable)
+            {
+                pendingTurnGuidanceFamily =
+                    TurnGuidanceFamily.Unavailable;
+
+                pendingTurnGuidanceConfirmationCount =
+                    0;
+
+                return candidate;
+            }
+
+            TurnGuidanceFamily candidateFamily =
+                GetTurnGuidanceFamily(
+                    candidate.Instruction);
+
+            TurnGuidanceFamily currentFamily =
+                lastTurnGuidance.IsAvailable
+                    ? GetTurnGuidanceFamily(
+                        lastTurnGuidance.Instruction)
+                    : TurnGuidanceFamily.Unavailable;
+
+            /*
+             * A disagreement or camera misalignment must suppress an unsafe
+             * directional command immediately. Recovery into a directional
+             * command is still confirmed below.
+             */
+            if (candidateFamily ==
+                TurnGuidanceFamily.FollowRoute)
+            {
+                pendingTurnGuidanceFamily =
+                    TurnGuidanceFamily.Unavailable;
+
+                pendingTurnGuidanceConfirmationCount =
+                    0;
+
+                return candidate;
+            }
+
+            if (currentFamily ==
+                    TurnGuidanceFamily.Unavailable ||
+                currentFamily ==
+                    candidateFamily)
+            {
+                pendingTurnGuidanceFamily =
+                    TurnGuidanceFamily.Unavailable;
+
+                pendingTurnGuidanceConfirmationCount =
+                    0;
+
+                return candidate;
+            }
+
+            if (pendingTurnGuidanceFamily !=
+                candidateFamily)
+            {
+                pendingTurnGuidanceFamily =
+                    candidateFamily;
+
+                pendingTurnGuidanceConfirmationCount =
+                    1;
+            }
+            else
+            {
+                pendingTurnGuidanceConfirmationCount++;
+            }
+
+            if (pendingTurnGuidanceConfirmationCount >=
+                TurnGuidanceChangeRequiredConfirmations)
+            {
+                pendingTurnGuidanceFamily =
+                    TurnGuidanceFamily.Unavailable;
+
+                pendingTurnGuidanceConfirmationCount =
+                    0;
+
+                stabilizedReason =
+                    candidateReason +
+                    "; CHANGE_CONFIRMED";
+
+                return candidate;
+            }
+
+            stabilizedReason =
+                candidateReason +
+                "; CHANGE_PENDING";
+
+            return CreateFollowCyanRouteGuidance(
+                candidate,
+                cameraHeadingAvailable: false,
+                cameraToRouteHeadingDegrees: 0.0);
+        }
+
+        private static TurnGuidanceFamily GetTurnGuidanceFamily(
+            PedestrianTurnGuidanceService.TurnInstruction instruction)
+        {
+            return instruction switch
+            {
+                PedestrianTurnGuidanceService.TurnInstruction.SlightLeft or
+                PedestrianTurnGuidanceService.TurnInstruction.Left or
+                PedestrianTurnGuidanceService.TurnInstruction.SharpLeft =>
+                    TurnGuidanceFamily.Left,
+
+                PedestrianTurnGuidanceService.TurnInstruction.SlightRight or
+                PedestrianTurnGuidanceService.TurnInstruction.Right or
+                PedestrianTurnGuidanceService.TurnInstruction.SharpRight =>
+                    TurnGuidanceFamily.Right,
+
+                PedestrianTurnGuidanceService.TurnInstruction.UTurn =>
+                    TurnGuidanceFamily.UTurn,
+
+                PedestrianTurnGuidanceService.TurnInstruction.Arrive =>
+                    TurnGuidanceFamily.Arrive,
+
+                PedestrianTurnGuidanceService.TurnInstruction.FollowRoute =>
+                    TurnGuidanceFamily.FollowRoute,
+
+                _ =>
+                    TurnGuidanceFamily.Straight
+            };
+        }
+
+        private static int GetDistanceBucket(
+            double distanceMeters)
+        {
+            return double.IsFinite(
+                distanceMeters)
+                ? (int)Math.Floor(
+                    Math.Max(
+                        0.0,
+                        distanceMeters) /
+                    5.0)
+                : -1;
+        }
+
         private void ApplyPrototypeTurnGuidance(
             PedestrianTurnGuidanceService.TurnGuidanceSnapshot guidance)
         {
@@ -4927,6 +7007,25 @@ namespace RescuAR.App.Views.Camera
             bool correctiveGuidance =
                 guidance.Instruction ==
                     PedestrianTurnGuidanceService.TurnInstruction.UTurn;
+
+            double visibleRouteHorizonMeters =
+                GetVisibleRouteHorizonMeters();
+
+            bool turnInstruction =
+                IsDirectionalTurnInstruction(
+                    guidance.Instruction);
+
+            bool turnBeyondVisibleCyanRoute =
+                turnInstruction &&
+                double.IsFinite(
+                    guidance.DistanceToTurnMeters) &&
+                double.IsFinite(
+                    visibleRouteHorizonMeters) &&
+                guidance.DistanceToTurnMeters >
+                    Math.Max(
+                        10.0,
+                        visibleRouteHorizonMeters +
+                            2.0);
 
             /*
              * The Figma prototype uses a pale green corrective card for
@@ -4972,13 +7071,61 @@ namespace RescuAR.App.Views.Camera
                     "lucide_chevron_down_black.png";
             }
 
-            switch (guidance.Instruction)
+            if (turnBeyondVisibleCyanRoute)
             {
+                turnDirectionIconLabel.Source =
+                    "lucide_arrow_up_teal.png";
+
+                turnInstructionLabel.Text =
+                    $"Continue straight — {GetUpcomingTurnText(guidance.Instruction)} " +
+                    $"in {distanceText}";
+            }
+            else switch (guidance.Instruction)
+            {
+                case PedestrianTurnGuidanceService.TurnInstruction.FollowRoute:
+                {
+                    double cameraToRoute =
+                        lastCameraToRouteHeadingDegrees ??
+                            0.0;
+
+                    if (Math.Abs(
+                            cameraToRoute) >=
+                        RouteLocatorBehindAngleDegrees)
+                    {
+                        turnDirectionIconLabel.Source =
+                            "lucide_undo_2_green.png";
+                    }
+                    else if (cameraToRoute >
+                        CameraRouteAlignmentExitDegrees)
+                    {
+                        turnDirectionIconLabel.Source =
+                            "lucide_arrow_up_right_teal.png";
+                    }
+                    else if (cameraToRoute <
+                        -CameraRouteAlignmentExitDegrees)
+                    {
+                        turnDirectionIconLabel.Source =
+                            "lucide_arrow_up_left_teal.png";
+                    }
+                    else
+                    {
+                        turnDirectionIconLabel.Source =
+                            "lucide_arrow_up_teal.png";
+                    }
+
+                    turnInstructionLabel.Text =
+                        string.IsNullOrWhiteSpace(
+                            guidance.DisplayText)
+                            ? "Follow the cyan route"
+                            : guidance.DisplayText;
+                    break;
+                }
+
                 case PedestrianTurnGuidanceService.TurnInstruction.SlightLeft:
                     turnDirectionIconLabel.Source =
                         "lucide_arrow_up_left_teal.png";
                     turnInstructionLabel.Text =
-                        $"Bear left for {distanceText}";
+                        $"Bear left in {distanceText}";
                     break;
 
                 case PedestrianTurnGuidanceService.TurnInstruction.Left:
@@ -4993,7 +7140,7 @@ namespace RescuAR.App.Views.Camera
                     turnDirectionIconLabel.Source =
                         "lucide_arrow_up_right_teal.png";
                     turnInstructionLabel.Text =
-                        $"Bear right for {distanceText}";
+                        $"Bear right in {distanceText}";
                     break;
 
                 case PedestrianTurnGuidanceService.TurnInstruction.Right:
@@ -5037,6 +7184,86 @@ namespace RescuAR.App.Views.Camera
                 _lastSpokenInstruction = turnInstructionLabel.Text;
                 _ = SpeakTurnInstructionAsync(turnInstructionLabel.Text);
             }
+        }
+
+        private static bool IsDirectionalTurnInstruction(
+            PedestrianTurnGuidanceService.TurnInstruction instruction)
+        {
+            return instruction ==
+                       PedestrianTurnGuidanceService.TurnInstruction.SlightLeft ||
+                   instruction ==
+                       PedestrianTurnGuidanceService.TurnInstruction.Left ||
+                   instruction ==
+                       PedestrianTurnGuidanceService.TurnInstruction.SharpLeft ||
+                   instruction ==
+                       PedestrianTurnGuidanceService.TurnInstruction.SlightRight ||
+                   instruction ==
+                       PedestrianTurnGuidanceService.TurnInstruction.Right ||
+                   instruction ==
+                       PedestrianTurnGuidanceService.TurnInstruction.SharpRight;
+        }
+
+        private static string GetUpcomingTurnText(
+            PedestrianTurnGuidanceService.TurnInstruction instruction)
+        {
+            return instruction switch
+            {
+                PedestrianTurnGuidanceService.TurnInstruction.SlightLeft =>
+                    "bear left",
+                PedestrianTurnGuidanceService.TurnInstruction.Left =>
+                    "turn left",
+                PedestrianTurnGuidanceService.TurnInstruction.SharpLeft =>
+                    "sharp left",
+                PedestrianTurnGuidanceService.TurnInstruction.SlightRight =>
+                    "bear right",
+                PedestrianTurnGuidanceService.TurnInstruction.Right =>
+                    "turn right",
+                PedestrianTurnGuidanceService.TurnInstruction.SharpRight =>
+                    "sharp right",
+                _ =>
+                    "turn"
+            };
+        }
+
+        private static double GetVisibleRouteHorizonMeters()
+        {
+            ARRouteBridge.RouteSnapshot route =
+                ARRouteBridge.Current;
+
+            if (!route.IsAvailable ||
+                route.Points.Count ==
+                    0)
+            {
+                return double.NaN;
+            }
+
+            double maximumDistance =
+                double.NaN;
+
+            for (int i = 0;
+                 i < route.Points.Count;
+                 i++)
+            {
+                double distance =
+                    route.Points[i]
+                        .DistanceFromWindowStartMeters;
+
+                if (!double.IsFinite(
+                        distance))
+                {
+                    continue;
+                }
+
+                maximumDistance =
+                    !double.IsFinite(
+                        maximumDistance)
+                        ? distance
+                        : Math.Max(
+                            maximumDistance,
+                            distance);
+            }
+
+            return maximumDistance;
         }
 
         private void ApplyPrototypeHazardReroutingState(
@@ -5130,14 +7357,41 @@ namespace RescuAR.App.Views.Camera
 
         private void ResetTurnGuidance()
         {
-            lastTurnGuidance =
-                PedestrianTurnGuidanceService.TurnGuidanceSnapshot.Unavailable;
+            lock (turnGuidanceSync)
+            {
+                lastTurnGuidance =
+                    PedestrianTurnGuidanceService.TurnGuidanceSnapshot.Unavailable;
 
-            lastLoggedTurnInstruction =
-                PedestrianTurnGuidanceService.TurnInstruction.Continue;
+                lastVisibleTurnGuidance =
+                    PedestrianTurnGuidanceService.VisibleTurnGuidanceSnapshot.Unavailable;
 
-            lastLoggedTurnDistanceBucket =
-                -1;
+                lastTurnGuidanceConsolidationReason =
+                    "Unavailable";
+
+                lastCameraToRouteHeadingDegrees =
+                    null;
+
+                cameraAlignedWithVisibleRoute =
+                    false;
+
+                cameraRouteAlignmentInitialized =
+                    false;
+
+                pendingTurnGuidanceFamily =
+                    TurnGuidanceFamily.Unavailable;
+
+                pendingTurnGuidanceConfirmationCount =
+                    0;
+
+                lastLoggedTurnConsolidationSignature =
+                    string.Empty;
+
+                lastLoggedTurnInstruction =
+                    PedestrianTurnGuidanceService.TurnInstruction.Continue;
+
+                lastLoggedTurnDistanceBucket =
+                    -1;
+            }
 
             Dispatcher.Dispatch(
                 () =>
@@ -5200,7 +7454,7 @@ namespace RescuAR.App.Views.Camera
                      decision.ConfirmationCount ==
                          0)
             {
-                Log.Debug(
+                LogDetailedDebug(
                     SafeZoneLogTag,
                     "Arrival confirmation sequence RESET: " +
                     $"distanceToDestination={decision.DistanceToDestinationMeters:F1} m, " +
@@ -5244,7 +7498,7 @@ namespace RescuAR.App.Views.Camera
             Log.Info(
                 SafeZoneLogTag,
                 "SAFE ZONE CONFIRMED: " +
-                $"destination='{activeDestinationName}', " +
+                $"destination='{DiagnosticPrivacyPolicy.FormatRouteLabel(activeDestinationName)}', " +
                 $"distanceToDestination={decision.DistanceToDestinationMeters:F1} m, " +
                 $"safeZoneRadius={decision.ArrivalRadiusMeters:F1} m, " +
                 $"remaining={decision.RemainingRouteMeters:F1} m/" +
@@ -5256,10 +7510,13 @@ namespace RescuAR.App.Views.Camera
 #endif
 
             string destinationName =
+#if RESCUAR_DIAGNOSTICS
                 EnableDeveloperSafeZoneValidation &&
                 developerSafeZoneValidationArmed
                     ? "DEV Safe Zone Test"
-                    : string.IsNullOrWhiteSpace(
+                    :
+#endif
+                    string.IsNullOrWhiteSpace(
                         activeDestinationName)
                         ? "Evacuation Center"
                         : activeDestinationName;
@@ -5332,6 +7589,7 @@ namespace RescuAR.App.Views.Camera
             lastLoggedSafeZoneConfirmationCount =
                 -1;
 
+#if RESCUAR_DIAGNOSTICS
             developerSafeZoneValidationArmed =
                 false;
 
@@ -5340,11 +7598,12 @@ namespace RescuAR.App.Views.Camera
 
             developerSafeZoneTargetProgressMeters =
                 double.NaN;
+#endif
 
 #if ANDROID
             if (hadArrivalState)
             {
-                Log.Debug(
+                LogDetailedDebug(
                     SafeZoneLogTag,
                     $"Safe-zone confirmation state reset: {reason}.");
             }
@@ -5368,6 +7627,7 @@ namespace RescuAR.App.Views.Camera
                     safeZoneTimeTakenLabel.Text =
                         "0 minutes";
 
+#if RESCUAR_DIAGNOSTICS
                     if (developerSafeZoneTestButton is not null)
                     {
                         developerSafeZoneTestButton.Text =
@@ -5376,11 +7636,13 @@ namespace RescuAR.App.Views.Camera
                         developerSafeZoneTestButton.IsEnabled =
                             true;
                     }
+#endif
 
                     RefreshCameraModuleDynamicUi();
                 });
         }
 
+#if RESCUAR_DIAGNOSTICS
         private void OnDeveloperSafeZoneTestClicked(
             object? sender,
             EventArgs e)
@@ -5468,11 +7730,12 @@ namespace RescuAR.App.Views.Camera
                 $"currentProgress={progress.CommittedProgressMeters:F1} m, " +
                 $"targetCenterAhead={DeveloperSafeZoneTargetAheadMeters:F1} m, " +
                 $"targetProgress={targetProgressMeters:F1} m, " +
-                $"target=({targetCoordinate.Latitude:F7},{targetCoordinate.Longitude:F7}), " +
+                $"target={DiagnosticPrivacyPolicy.FormatCoordinate(targetCoordinate.Latitude, targetCoordinate.Longitude)}, " +
                 $"devArrivalRadius={SafeZoneConfirmationService.ArrivalRadiusMeters:F1} m. " +
                 "The DEV target intentionally keeps the original 30 m baseline so the existing test remains deterministic. Stay near the arming point and wait for three DISTINCT qualifying GPS observations.");
 #endif
         }
+#endif
 
         private static bool TryGetRouteCoordinateAtProgress(
             RouteResult route,
@@ -5592,6 +7855,8 @@ namespace RescuAR.App.Views.Camera
 
             bool renderLocalDepthInAr =
                 hasLocalArDepth &&
+                HasUsableArGround() &&
+                !lowLightFallbackActive &&
                 currentCameraModuleView ==
                     CameraModuleViewMode.FloodDepth &&
                 pageIsVisible;
@@ -5600,6 +7865,7 @@ namespace RescuAR.App.Views.Camera
             {
                 ARFloodDepthBridge.PublishLocalDepth(
                     snapshot.LocalDepthMeters!.Value,
+                    IsFloodDepthArModeActive(),
                     snapshot.SourceText);
             }
             else
@@ -5641,7 +7907,12 @@ namespace RescuAR.App.Views.Camera
                         !safeZoneConfirmed;
 
                     floodWaitingBanner.IsVisible =
-                        false;
+                        hasLocalArDepth &&
+                        !lowLightFallbackActive &&
+                        !HasVerifiedArGround();
+
+                    floodWaitingLabel.Text =
+                        GetFloodWaitingMessage();
 
                     floodModeDepthSummaryLabel.Text =
                         snapshot.PrimaryText;
@@ -5687,25 +7958,40 @@ namespace RescuAR.App.Views.Camera
                 currentCameraModuleView ==
                     CameraModuleViewMode.FloodDepth;
 
+            bool verifiedGround =
+                HasVerifiedArGround();
+
+            bool provisionalGround =
+                HasProvisionalArGround();
+
+            bool usableGround =
+                verifiedGround ||
+                provisionalGround;
+
             bool shouldShow =
                 visible &&
-                floodModeActive;
+                floodModeActive &&
+                !lowLightFallbackActive;
 
             if (!shouldShow)
             {
                 ARFloodDepthBridge.Clear(
                     reason);
             }
-            else if (hasLocalArDepth)
+            else if (hasLocalArDepth &&
+                     usableGround)
             {
                 ARFloodDepthBridge.PublishLocalDepth(
                     currentFloodVisualization.LocalDepthMeters!.Value,
+                    IsFloodDepthArModeActive(),
                     currentFloodVisualization.SourceText);
             }
             else
             {
                 ARFloodDepthBridge.Clear(
-                    "Flood Depth sub-tab has context but no trusted local depth");
+                    hasLocalArDepth
+                        ? "Flood Depth is waiting for an AR ground reference"
+                        : "Flood Depth sub-tab has context but no trusted local depth");
             }
 
             Dispatcher.Dispatch(
@@ -5719,16 +8005,25 @@ namespace RescuAR.App.Views.Camera
 
                     floodWaitingBanner.IsVisible =
                         floodModeActive &&
-                        !currentFloodVisualization.IsAvailable &&
+                        !lowLightFallbackActive &&
+                        (!currentFloodVisualization.IsAvailable ||
+                         (hasLocalArDepth &&
+                          !verifiedGround)) &&
                         pageIsVisible &&
                         !safeZoneConfirmed;
+
+                    floodWaitingLabel.Text =
+                        GetFloodWaitingMessage();
                 });
 
 #if ANDROID
-            Log.Debug(
+            LogDetailedDebug(
                 FloodDepthLogTag,
                 $"Flood visualization visibility={shouldShow}; " +
-                $"arSpaceWater={(shouldShow && hasLocalArDepth)}; " +
+                $"verifiedGround={verifiedGround}; " +
+                $"provisionalGround={provisionalGround}; " +
+                $"lowLight={lowLightFallbackActive}; " +
+                $"arSpaceWater={(shouldShow && hasLocalArDepth && usableGround && !lowLightFallbackActive)}; " +
                 $"reason='{reason}'.");
 #endif
         }
@@ -5757,6 +8052,9 @@ namespace RescuAR.App.Views.Camera
                         pageIsVisible &&
                         !safeZoneConfirmed;
 
+                    floodWaitingLabel.Text =
+                        GetFloodWaitingMessage();
+
                     floodModeDepthSummaryLabel.Text =
                         "No trusted local depth is currently available";
 
@@ -5766,13 +8064,14 @@ namespace RescuAR.App.Views.Camera
 #if ANDROID
             if (wasAvailable)
             {
-                Log.Debug(
+                LogDetailedDebug(
                     FloodDepthLogTag,
                     $"FLOOD VISUALIZATION CLEARED: {reason}.");
             }
 #endif
         }
 
+#if RESCUAR_DIAGNOSTICS
         private void OnDeveloperFloodDepthTestClicked(
             object? sender,
             EventArgs e)
@@ -5834,6 +8133,7 @@ namespace RescuAR.App.Views.Camera
                 $"next='{developerFloodDepthTestButton.Text}'.");
 #endif
         }
+#endif
 
         private void SubscribeEmergencyAdvisories()
         {
@@ -5855,7 +8155,7 @@ namespace RescuAR.App.Views.Camera
             RealtimeAdvisoryManager.StartRealtimeListener();
 
 #if ANDROID
-            Log.Debug(
+            LogDetailedDebug(
                 EmergencyAlertLogTag,
                 "Camera subscribed to the existing real-time emergency advisory source.");
 #endif
@@ -5875,7 +8175,7 @@ namespace RescuAR.App.Views.Camera
                 false;
 
 #if ANDROID
-            Log.Debug(
+            LogDetailedDebug(
                 EmergencyAlertLogTag,
                 "Camera unsubscribed from real-time emergency advisories.");
 #endif
@@ -5956,10 +8256,10 @@ namespace RescuAR.App.Views.Camera
             Log.Info(
                 EmergencyAlertLogTag,
                 "CAMERA EMERGENCY ADVISORY SHOWN: " +
-                $"id='{advisory.Id}', " +
+                $"id='{DiagnosticPrivacyPolicy.FormatRouteLabel(advisory.Id)}', " +
                 $"level='{advisory.DisplayAlertLevel}', " +
                 $"category='{advisory.Category}', " +
-                $"title='{advisory.Title}', " +
+                $"title='{DiagnosticPrivacyPolicy.FormatRouteLabel(advisory.Title)}', " +
                 $"highSeverity={isHighSeverity}, " +
                 $"autoStartSeconds=" +
                 $"{(isHighSeverity ? HighSeverityEmergencyAutoStartSeconds : 0)}.");
@@ -6104,7 +8404,7 @@ namespace RescuAR.App.Views.Camera
                         "#F59E0B");
 
 #if ANDROID
-                Log.Debug(
+                LogDetailedDebug(
                     EmergencyAlertLogTag,
                     "Camera emergency advisory theme applied: MODERATE/ORANGE.");
 #endif
@@ -6131,7 +8431,7 @@ namespace RescuAR.App.Views.Camera
                     "#FF3B43");
 
 #if ANDROID
-            Log.Debug(
+            LogDetailedDebug(
                 EmergencyAlertLogTag,
                 "Camera emergency advisory theme applied: HIGH/DEFAULT RED.");
 #endif
@@ -6153,7 +8453,7 @@ namespace RescuAR.App.Views.Camera
             Log.Warn(
                 EmergencyAlertLogTag,
                 "HIGH-SEVERITY AR AUTO-START ARMED: " +
-                $"id='{advisory.Id}', " +
+                $"id='{DiagnosticPrivacyPolicy.FormatRouteLabel(advisory.Id)}', " +
                 $"countdown={HighSeverityEmergencyAutoStartSeconds}s.");
 #endif
 
@@ -6200,11 +8500,11 @@ namespace RescuAR.App.Views.Camera
                         });
 
 #if ANDROID
-                    Log.Debug(
+                    LogDetailedDebug(
                         EmergencyAlertLogTag,
                         "High-severity AR auto-start countdown: " +
                         $"{countdownValue}s remaining, " +
-                        $"id='{advisory.Id}'.");
+                        $"id='{DiagnosticPrivacyPolicy.FormatRouteLabel(advisory.Id)}'.");
 #endif
 
                     await Task.Delay(
@@ -6235,7 +8535,7 @@ namespace RescuAR.App.Views.Camera
                 Log.Warn(
                     EmergencyAlertLogTag,
                     "HIGH-SEVERITY AR AUTO-START COUNTDOWN COMPLETE. " +
-                    $"Starting evacuation guidance for advisory id='{advisory.Id}'.");
+                    $"Starting evacuation guidance for advisory id='{DiagnosticPrivacyPolicy.FormatRouteLabel(advisory.Id)}'.");
 #endif
 
                 await StartEmergencyArGuidanceAsync(
@@ -6245,9 +8545,9 @@ namespace RescuAR.App.Views.Camera
             catch (OperationCanceledException)
             {
 #if ANDROID
-                Log.Debug(
+                LogDetailedDebug(
                     EmergencyAlertLogTag,
-                    $"High-severity AR auto-start cancelled for advisory id='{advisory.Id}'.");
+                    $"High-severity AR auto-start cancelled for advisory id='{DiagnosticPrivacyPolicy.FormatRouteLabel(advisory.Id)}'.");
 #endif
             }
             catch (Exception exception)
@@ -6255,7 +8555,7 @@ namespace RescuAR.App.Views.Camera
 #if ANDROID
                 Log.Error(
                     EmergencyAlertLogTag,
-                    $"High-severity AR auto-start failed: {exception}");
+                    $"High-severity AR auto-start failed: {DiagnosticPrivacyPolicy.FormatException(exception)}");
 #endif
             }
             finally
@@ -6298,7 +8598,7 @@ namespace RescuAR.App.Views.Camera
             cancellation.Dispose();
 
 #if ANDROID
-            Log.Debug(
+            LogDetailedDebug(
                 EmergencyAlertLogTag,
                 $"Emergency AR auto-start countdown cancelled: {reason}.");
 #endif
@@ -6353,7 +8653,7 @@ namespace RescuAR.App.Views.Camera
                     EmergencyAlertLogTag,
                     "EMERGENCY AR GUIDANCE START REQUESTED: " +
                     $"trigger='{trigger}', " +
-                    $"id='{advisory.Id}', " +
+                    $"id='{DiagnosticPrivacyPolicy.FormatRouteLabel(advisory.Id)}', " +
                     $"level='{advisory.DisplayAlertLevel}', " +
                     $"category='{advisory.Category}'.");
 #endif
@@ -6393,7 +8693,7 @@ namespace RescuAR.App.Views.Camera
                     Log.Info(
                         EmergencyAlertLogTag,
                         "Emergency guidance will retain the existing destination: " +
-                        $"'{destination.Name}'.");
+                        $"'{DiagnosticPrivacyPolicy.FormatRouteLabel(destination.Name)}'.");
 #endif
 
                     if (activeRoute is null &&
@@ -6452,7 +8752,7 @@ namespace RescuAR.App.Views.Camera
 #if ANDROID
                     if (reading is not null)
                     {
-                        Log.Debug(
+                        LogDetailedDebug(
                             EmergencyAlertLogTag,
                             "Cached location is too old/inaccurate for emergency destination selection; requesting a fresh location.");
                     }
@@ -6549,7 +8849,7 @@ namespace RescuAR.App.Views.Camera
 #if ANDROID
                     Log.Warn(
                         EmergencyAlertLogTag,
-                        $"Emergency AR guidance destination publish failed for '{nearestCenter.Name}'.");
+                        $"Emergency AR guidance destination publish failed for '{DiagnosticPrivacyPolicy.FormatRouteLabel(nearestCenter.Name)}'.");
 #endif
 
                     await DisplayAlert(
@@ -6564,10 +8864,10 @@ namespace RescuAR.App.Views.Camera
                 Log.Info(
                     EmergencyAlertLogTag,
                     "EMERGENCY AR DESTINATION SELECTED: " +
-                    $"name='{nearestCenter.Name}', " +
+                    $"name='{DiagnosticPrivacyPolicy.FormatRouteLabel(nearestCenter.Name)}', " +
                     $"distance={nearest.DistanceInMeters:F1} m, " +
-                    $"origin=({reading.Coordinate.Latitude:F7},{reading.Coordinate.Longitude:F7}), " +
-                    $"destination=({nearestCenter.Latitude:F7},{nearestCenter.Longitude:F7}).");
+                    $"origin={DiagnosticPrivacyPolicy.FormatCoordinate(reading.Coordinate.Latitude, reading.Coordinate.Longitude)}, " +
+                    $"destination={DiagnosticPrivacyPolicy.FormatCoordinate(nearestCenter.Latitude, nearestCenter.Longitude)}.");
 #endif
 
                 /*
@@ -6589,7 +8889,7 @@ namespace RescuAR.App.Views.Camera
 #if ANDROID
                 Log.Error(
                     EmergencyAlertLogTag,
-                    $"Emergency AR guidance start failed: {exception}");
+                    $"Emergency AR guidance start failed: {DiagnosticPrivacyPolicy.FormatException(exception)}");
 #endif
 
                 if (pageIsVisible)
@@ -6672,7 +8972,7 @@ namespace RescuAR.App.Views.Camera
 #if ANDROID
             if (wasVisible)
             {
-                Log.Debug(
+                LogDetailedDebug(
                     EmergencyAlertLogTag,
                     $"Camera emergency advisory hidden: {reason}.");
             }
@@ -6919,7 +9219,7 @@ namespace RescuAR.App.Views.Camera
 #if ANDROID
                 Log.Warn(
                     SafeZoneLogTag,
-                    $"Opening guidance session details failed: {exception.Message}");
+                    $"Opening guidance session details failed: {DiagnosticPrivacyPolicy.FormatException(exception)}");
 #endif
             }
         }
@@ -6949,7 +9249,7 @@ namespace RescuAR.App.Views.Camera
 #if ANDROID
                 Log.Warn(
                     SafeZoneLogTag,
-                    $"Navigation was cleared, but returning to Home failed: {exception.Message}");
+                    $"Navigation was cleared, but returning to Home failed: {DiagnosticPrivacyPolicy.FormatException(exception)}");
 #endif
             }
         }
@@ -7004,7 +9304,7 @@ namespace RescuAR.App.Views.Camera
                 decision.Disposition ==
                     HeadingRevalidationDisposition.CorrectionCooldown)
             {
-                Log.Debug(
+                LogDetailedDebug(
                     HeadingLogTag,
                     "HEADING REVALIDATION: " +
                     $"state={decision.Disposition}, " +
@@ -7129,12 +9429,28 @@ namespace RescuAR.App.Views.Camera
             PedestrianDeadReckoningService.PdrStepDetectedEventArgs e)
         {
 #if ANDROID
+            Log.Info(
+                PdrLogTag,
+                "PDR STEP OUTCOME: outcome=DETECTED; " +
+                $"step={e.StepNumber}; " +
+                $"peakDynamicG={e.PeakDynamicAccelerationG:F3}; " +
+                $"magnitudeG={e.AccelerationMagnitudeG:F3}; " +
+                $"peakDurationMs={e.PeakDurationMilliseconds:F0}.");
+
             if (!EnablePedestrianDeadReckoning ||
                 safeZoneConfirmed ||
                 !pageIsVisible ||
                 !_arCoreService.IsInitialized ||
                 _arCoreService.IsSessionPaused)
             {
+                RecordPdrStepRejection(
+                    e,
+                    "SERVICE_STATE",
+                    $"enabled={EnablePedestrianDeadReckoning}, " +
+                    $"safeZone={safeZoneConfirmed}, visible={pageIsVisible}, " +
+                    $"initialized={_arCoreService.IsInitialized}, " +
+                    $"sessionPaused={_arCoreService.IsSessionPaused}");
+
                 return;
             }
 
@@ -7143,32 +9459,33 @@ namespace RescuAR.App.Views.Camera
 
             if (route is null)
             {
+                RecordPdrStepRejection(
+                    e,
+                    "NO_ACTIVE_ROUTE",
+                    "active route is unavailable");
+
                 return;
             }
 
-            if (!IndoorRouteTestMode &&
+            if (!IsIndoorRouteTestModeEnabled &&
                 lastRouteMatchConfidence <
-                RouteMatchConfidence.Medium)
+                    RouteMatchConfidence.Medium)
             {
-                rejectedPdrStepCount++;
-
-                LogDetailedDebug(
-                    PdrLogTag,
-                    "PDR step held because the current route-segment match " +
-                    $"is not trustworthy: confidence={lastRouteMatchConfidence}.");
+                RecordPdrStepRejection(
+                    e,
+                    "ROUTE_MATCH_LOW",
+                    $"confidence={lastRouteMatchConfidence}");
 
                 return;
             }
 
-            if (!IndoorRouteTestMode &&
+            if (!IsIndoorRouteTestModeEnabled &&
                 _gpsPdrFusionPolicy.IsRouteIdentitySuspended)
             {
-                rejectedPdrStepCount++;
-
-                LogDetailedDebug(
-                    PdrLogTag,
-                    "PDR step held while GPS route identity is unresolved. " +
-                    $"step={e.StepNumber}.");
+                RecordPdrStepRejection(
+                    e,
+                    "ROUTE_IDENTITY_SUSPENDED",
+                    "GPS route identity is unresolved");
 
                 return;
             }
@@ -7180,12 +9497,10 @@ namespace RescuAR.App.Views.Camera
                     out PdrHeadingSmoother.HeadingEstimate headingEstimate,
                     out string unavailableReason))
             {
-                rejectedPdrStepCount++;
-
-                LogDetailedDebug(
-                    PdrLogTag,
-                    "PDR step held: route-direction validation unavailable. " +
-                    $"step={e.StepNumber}, reason={unavailableReason}");
+                RecordPdrStepRejection(
+                    e,
+                    "HEADING_UNAVAILABLE",
+                    unavailableReason);
 
                 return;
             }
@@ -7211,12 +9526,9 @@ namespace RescuAR.App.Views.Camera
 
             if (!pdrConfidence.IsAccepted)
             {
-                rejectedPdrStepCount++;
-
-                LogDetailedDebug(
-                    PdrLogTag,
-                    "PDR step REJECTED by confidence gate: " +
-                    $"step={e.StepNumber}, " +
+                RecordPdrStepRejection(
+                    e,
+                    "HEADING_CONFIDENCE",
                     $"smoothedCameraArAzimuth={cameraAzimuthDegrees:F1} deg, " +
                     $"walkingArAzimuth=" +
                     $"{(headingEstimate.UsedWalkingVector ? headingEstimate.WalkingAzimuthDegrees.ToString("F1") : "<accumulating>")} deg, " +
@@ -7224,7 +9536,7 @@ namespace RescuAR.App.Views.Camera
                     $"error={headingErrorDegrees:F1} deg, " +
                     $"motionCoherence={headingEstimate.MotionCoherence:F2}, " +
                     $"confidence={pdrConfidence.Confidence}, " +
-                    $"reason='{pdrConfidence.Reason}'.");
+                    $"reason='{pdrConfidence.Reason}'");
 
                 return;
             }
@@ -7259,27 +9571,23 @@ namespace RescuAR.App.Views.Camera
 
             if (!update.IsAccepted)
             {
-                rejectedPdrStepCount++;
-
-                LogDetailedDebug(
-                    PdrLogTag,
-                    "PDR step could not advance route progress: " +
-                    $"step={e.StepNumber}, " +
-                    $"reason={update.RejectionReason}");
+                RecordPdrStepRejection(
+                    e,
+                    "PROGRESS_REJECTED",
+                    update.RejectionReason);
 
                 return;
             }
 
             acceptedPdrStepCount++;
 
-            UpdateTurnGuidance(
-                route);
+            UpdateTurnGuidance();
 
-            LogDetailedDebug(
+            Log.Info(
                 PdrLogTag,
-                "PDR step ACCEPTED: " +
-                $"step={e.StepNumber}, " +
-                $"acceptedSteps={acceptedPdrStepCount}, " +
+                "PDR STEP OUTCOME: outcome=ACCEPTED; " +
+                $"step={e.StepNumber}; " +
+                $"acceptedSteps={acceptedPdrStepCount}; " +
                 $"confidence={pdrConfidence.Confidence}, " +
                 $"strideScale={pdrConfidence.StrideScale:F2}, " +
                 $"advance={fusedStepAdvanceMeters:F2} m, " +
@@ -7288,6 +9596,25 @@ namespace RescuAR.App.Views.Camera
                 $"headingSource='{headingEstimate.Reason}', " +
                 $"motionCoherence={headingEstimate.MotionCoherence:F2}, " +
                 $"publishWindow={published}.");
+#endif
+        }
+
+        private void RecordPdrStepRejection(
+            PedestrianDeadReckoningService.PdrStepDetectedEventArgs step,
+            string reasonCode,
+            string detail)
+        {
+            rejectedPdrStepCount++;
+
+#if ANDROID
+            Log.Info(
+                PdrLogTag,
+                "PDR STEP OUTCOME: outcome=REJECTED; " +
+                $"step={step.StepNumber}; " +
+                $"rejectedSteps={rejectedPdrStepCount}; " +
+                $"reasonCode={reasonCode}; detail='{detail}'; " +
+                $"peakDynamicG={step.PeakDynamicAccelerationG:F3}; " +
+                $"peakDurationMs={step.PeakDurationMilliseconds:F0}.");
 #endif
         }
 
@@ -7511,7 +9838,7 @@ namespace RescuAR.App.Views.Camera
                 false;
 
 #if ANDROID
-            Log.Debug(
+            LogDetailedDebug(
                 RouteLogTag,
                 "AR route visual mode RESET to APPROACH/RECOVERY SHORT: " +
                 $"window={ApproachRouteVisualWindowMeters:F1} m, " +
@@ -7595,7 +9922,7 @@ namespace RescuAR.App.Views.Camera
             roadFollowingReentryConfirmationCount++;
 
 #if ANDROID
-            Log.Debug(
+            LogDetailedDebug(
                 RouteLogTag,
                 "Route-corridor visual-entry candidate: " +
                 $"confirmation={roadFollowingReentryConfirmationCount}/" +
@@ -7686,7 +10013,7 @@ namespace RescuAR.App.Views.Camera
                         $"{progressSource}/CORRIDOR-PENDING");
                 }
 
-                Log.Debug(
+                LogDetailedDebug(
                     ProgressLogTag,
                     $"{progressSource} RECOVERY CONNECTOR HELD: " +
                     $"verified={recoveryConnectorVerified}, " +
@@ -7720,7 +10047,7 @@ namespace RescuAR.App.Views.Camera
 
             if (published)
             {
-                Log.Debug(
+                LogDetailedDebug(
                     ProgressLogTag,
                     $"{progressSource} APPROACH-TO-ROUTE: " +
                     $"crossTrack={update.CrossTrackErrorMeters:F1} m, " +
@@ -7747,13 +10074,18 @@ namespace RescuAR.App.Views.Camera
             ARCameraPoseBridge.SpatialSnapshot spatial =
                 ARCameraPoseBridge.CurrentFrame;
 
+            ARTrackingStateBridge.TrackingSnapshot trackingSnapshot =
+                _arCoreService.TrackingSnapshot;
+
             bool tracking =
                 spatial.IsTracking &&
-                spatial.Pose.IsTracking;
+                spatial.Pose.IsTracking &&
+                trackingSnapshot.IsRenderableFor(
+                    spatial.Generation.SessionGeneration);
 
             if (!tracking)
             {
-                Log.Debug(
+                LogDetailedDebug(
                     ProgressLogTag,
                     "Moving route window waiting: ARCore is not tracking.");
 
@@ -7762,7 +10094,7 @@ namespace RescuAR.App.Views.Camera
 
             if (!spatial.Anchor.IsAvailable)
             {
-                Log.Debug(
+                LogDetailedDebug(
                     ProgressLogTag,
                     "Moving route window waiting: ground anchor is unavailable.");
 
@@ -7808,7 +10140,7 @@ namespace RescuAR.App.Views.Camera
             _routeProgressTracker.MarkWindowPublished(
                 update.CommittedProgressMeters);
 
-            Log.Debug(
+            LogDetailedDebug(
                 ProgressLogTag,
                 $"{progressSource} MOVING WINDOW: " +
                 $"segment={update.SegmentIndex}, " +
@@ -7973,8 +10305,7 @@ namespace RescuAR.App.Views.Camera
             ARRouteBridge.RouteSnapshot rebasedRoute =
                 ARRouteBridge.Current;
 
-            UpdateTurnGuidance(
-                route);
+            UpdateTurnGuidance();
 
             Log.Warn(
                 "RescuAR-AnchorRecovery",
@@ -8020,7 +10351,7 @@ namespace RescuAR.App.Views.Camera
                 route.Points.Count <
                     2)
             {
-                Log.Debug(
+                LogDetailedDebug(
                     "RescuAR-AnchorRecovery",
                     "Ground anchor recovered, but no active navigation route exists " +
                     "to rebase.");
@@ -8105,8 +10436,7 @@ namespace RescuAR.App.Views.Camera
             ARRouteBridge.RouteSnapshot recoveredRoute =
                 ARRouteBridge.Current;
 
-            UpdateTurnGuidance(
-                route);
+            UpdateTurnGuidance();
 
             Log.Warn(
                 "RescuAR-AnchorRecovery",
@@ -8180,7 +10510,7 @@ namespace RescuAR.App.Views.Camera
                     renderedArAzimuthDegrees -
                     predictedArAzimuthDegrees);
 
-            Log.Debug(
+            LogDetailedDebug(
                 HeadingLogTag,
                 "ROUTE DIRECTION: " +
                 $"firstLegTrueBearing={geographicFirstLegBearingDegrees:F2} deg, " +
@@ -8190,7 +10520,7 @@ namespace RescuAR.App.Views.Camera
                 $"renderedArFirstLegAzimuth={renderedArAzimuthDegrees:F2} deg, " +
                 $"axisAgreementError={axisAgreementErrorDegrees:F2} deg");
 
-            Log.Debug(
+            LogDetailedDebug(
                 HeadingLogTag,
                 "The cyan arrow points along the FIRST LOCAL ROUTE LEG, not " +
                 "directly at the evacuation center. The visible window is " +
@@ -8405,6 +10735,9 @@ namespace RescuAR.App.Views.Camera
             ARCameraPoseBridge.SpatialSnapshot spatial =
                 ARCameraPoseBridge.CurrentFrame;
 
+            ARTrackingStateBridge.TrackingSnapshot trackingSnapshot =
+                _arCoreService.TrackingSnapshot;
+
             ARRouteBridge.RouteSnapshot route =
                 ARRouteBridge.Current;
 
@@ -8413,7 +10746,9 @@ namespace RescuAR.App.Views.Camera
 
             bool tracking =
                 spatial.IsTracking &&
-                spatial.Pose.IsTracking;
+                spatial.Pose.IsTracking &&
+                trackingSnapshot.IsRenderableFor(
+                    spatial.Generation.SessionGeneration);
 
             /*
              * Recovery State V6
@@ -8471,7 +10806,7 @@ namespace RescuAR.App.Views.Camera
 
                 if (anchorRecoveryInProgress)
                 {
-                    Log.Debug(
+                    LogDetailedDebug(
                         "RescuAR-AnchorRecovery",
                         "Replacement ground anchor is TRACKING. Rebuilding the " +
                         "current route window in the new local frame: " +
@@ -8503,14 +10838,7 @@ namespace RescuAR.App.Views.Camera
                         activeGroundAnchorReplacementGeneration =
                             -1;
 
-                        /*
-                         * The service can now clear its replacement-search
-                         * state. The route was republished only once for the
-                         * actual replacement; there was no bridge Clear().
-                         */
-                        _arCoreService.TryRecoverGroundAnchorIfNeeded();
-
-                        Log.Debug(
+                        LogDetailedDebug(
                             "RescuAR-AnchorRecovery",
                             "Moving local-frame anchor replacement COMPLETE. " +
                             $"handledReplacementGeneration=" +
@@ -8535,26 +10863,6 @@ namespace RescuAR.App.Views.Camera
                  * natural relocalization without CameraPage disturbing it.
                  */
             }
-            else if (hasObservedGroundAnchor)
-            {
-                /*
-                 * This is either:
-                 *
-                 *  A) temporary retained-anchor PAUSED state during the
-                 *     proactive/final recovery window; or
-                 *
-                 *  B) an actual replacement floor search after the service has
-                 *     released the stale Anchor.
-                 *
-                 * The service owns that distinction. CameraPage does NOT clear
-                 * or republish ARRouteBridge here.
-                 *
-                 * The renderer owns the short visual-continuity behavior while
-                 * retaining the same route-root X/Z lock.
-                 */
-                _arCoreService.TryRecoverGroundAnchorIfNeeded();
-            }
-
             /*
              * LARGE IN-SESSION ARCORE WORLD CORRECTION
              * ----------------------------------------
@@ -8680,10 +10988,27 @@ namespace RescuAR.App.Views.Camera
                 lastDynamicUiRefreshTimestamp =
                     diagnosticTimestamp;
 
+                /*
+                 * Camera-relative alignment changes when the user rotates the
+                 * phone even if GPS progress does not change. Reconcile the
+                 * text panel on the same one-second UI cadence so an unsafe
+                 * left/right label is removed promptly instead of waiting for
+                 * the next location poll.
+                 */
+                if (currentCameraModuleView ==
+                        CameraModuleViewMode.ArCamera &&
+                    activeRoute is not null &&
+                    !dynamicRerouteInProgress &&
+                    !safeZoneConfirmed)
+                {
+                    UpdateTurnGuidance();
+                }
+
                 Dispatcher.Dispatch(
                     RefreshCameraModuleDynamicUi);
             }
 
+#if RESCUAR_DIAGNOSTICS
             long statusLogTimestamp =
                 diagnosticTimestamp;
 
@@ -8699,7 +11024,7 @@ namespace RescuAR.App.Views.Camera
             lastDetailedStatusLogTimestamp =
                 statusLogTimestamp;
 
-            Log.Debug(
+            LogDetailedDebug(
                 RouteLogTag,
                 "STATUS: " +
                 $"cameraPageActive={pageIsVisible}, " +
@@ -8707,7 +11032,15 @@ namespace RescuAR.App.Views.Camera
                 $"sessionPaused={_arCoreService.IsSessionPaused}, " +
                 $"frameLoop={_arCoreService.IsFrameLoopRunning}, " +
                 $"tracking={tracking}, " +
-                $"anchor={spatial.Anchor.IsAvailable}, " +
+                $"trackingState={trackingSnapshot.TrackingState}, " +
+                $"trackingReason='{trackingSnapshot.FailureReason}', " +
+                $"trackingLifecycleEvent={trackingSnapshot.IsIntentionalLifecycleEvent}, " +
+                $"trackingLossMs={trackingSnapshot.CurrentLossDurationMilliseconds}, " +
+                $"trackingActivePauses={trackingSnapshot.ActivePauseTransitionCount}, " +
+                $"trackingLifecyclePauses={trackingSnapshot.LifecyclePauseTransitionCount}, " +
+                $"trackingRecoveries={trackingSnapshot.RecoveryTransitionCount}, " +
+                $"trackingDepthEnabled={trackingSnapshot.DepthEnabled}, " +
+                $"groundReferenceAvailable={spatial.Anchor.IsAvailable}, " +
                 $"cameraToAnchor=" +
                 $"{(float.IsFinite(cameraToAnchorHorizontalMeters) ? cameraToAnchorHorizontalMeters.ToString("F2") : "<none>")}m, " +
                 $"anchorRetirement=" +
@@ -8724,15 +11057,18 @@ namespace RescuAR.App.Views.Camera
                 $"spatialContinuity={continuityStatus.State}, " +
                 $"spatialLossDuration={continuityStatus.DurationMilliseconds}ms, " +
                 $"spatialTrustScore={continuityStatus.TrustScore}/100, " +
-                $"guidanceConfidence={lastArGuidanceConfidence.State}, " +
-                $"guidanceConfidenceScore={lastArGuidanceConfidence.Score}/100, " +
-                $"guidanceRouteAllowed={lastArGuidanceConfidence.AllowsRouteGeometry}, " +
+                $"guidanceReadiness={lastArGuidanceConfidence.State}, " +
+                $"guidanceReadinessScore={lastArGuidanceConfidence.Score}/100, " +
+                $"routeVisibilityAllowed={lastArGuidanceConfidence.AllowsRouteGeometry}, " +
+                $"diagnosticRouteOverride=" +
+                $"{diagnosticRouteVisibilityOverrideActive}, " +
                 $"destination={NavigationDestinationBridge.Current.IsAvailable}, " +
+                $"routeAlgorithm='{activeRoute?.Algorithm ?? "<none>"}', " +
                 $"headingAligned={lastHeadingAlignment.HasValue}, " +
                 $"headingStable={lastHeadingAlignment?.IsStable ?? false}, " +
                 $"mapToArYaw=" +
                 $"{(lastHeadingAlignment?.MapToArYawDegrees ?? 0.0):F1}, " +
-                $"routePublished={route.IsAvailable}, " +
+                $"routeGeometryPublished={route.IsAvailable}, " +
                 $"routeVersion={route.Version}, " +
                 $"routePoints={route.Points.Count}, " +
                 $"routeVisualKind={route.NavigationState.VisualKind}, " +
@@ -8775,6 +11111,15 @@ namespace RescuAR.App.Views.Camera
                 $"{(lastTurnGuidance.IsAvailable ? lastTurnGuidance.Instruction.ToString() : "<none>")}, " +
                 $"turnDistance=" +
                 $"{(lastTurnGuidance.IsAvailable && double.IsFinite(lastTurnGuidance.DistanceToTurnMeters) ? lastTurnGuidance.DistanceToTurnMeters.ToString("F1") : "<none>")}m, " +
+                $"cyanTurnInstruction=" +
+                $"{(lastVisibleTurnGuidance.IsAvailable ? lastVisibleTurnGuidance.Instruction.ToString() : "<none>")}, " +
+                $"cyanTurnDistance=" +
+                $"{(lastVisibleTurnGuidance.IsAvailable && double.IsFinite(lastVisibleTurnGuidance.DistanceToTurnMeters) ? lastVisibleTurnGuidance.DistanceToTurnMeters.ToString("F1") : "<none>")}m, " +
+                $"cameraToRoute=" +
+                $"{(lastCameraToRouteHeadingDegrees.HasValue ? lastCameraToRouteHeadingDegrees.Value.ToString("F1") : "<none>")}deg, " +
+                $"cameraRouteAligned={cameraAlignedWithVisibleRoute}, " +
+                $"turnConsolidationReason='{lastTurnGuidanceConsolidationReason}', " +
+                $"turnPanelVisible={turnGuidancePanel.IsVisible}, " +
                 $"safeZoneCandidate={lastSafeZoneDecision.IsCandidate}, " +
                 $"safeZoneConfirmations={lastSafeZoneDecision.ConfirmationCount}/" +
                 $"{lastSafeZoneDecision.RequiredConfirmationCount}, " +
@@ -8792,6 +11137,7 @@ namespace RescuAR.App.Views.Camera
                 $"{(double.IsFinite(progress.CrossTrackErrorMeters) ? progress.CrossTrackErrorMeters.ToString("F1") : "<none>")}m, " +
                 $"offRoute={progress.IsOffRoute}, " +
                 $"routeVisibleExpected={routeShouldBeVisible}");
+#endif
 #endif
         }
 

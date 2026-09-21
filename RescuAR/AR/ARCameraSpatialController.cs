@@ -86,6 +86,9 @@ public static class ARCameraSpatialController
     private static long lockedRouteVersion =
         -1;
 
+    private static long appliedGroundReferenceGeneration =
+        -1;
+
     private static int lastLoggedAnchorDriftBucket =
         -1;
 
@@ -155,7 +158,6 @@ public static class ARCameraSpatialController
         90;
 
     private static bool hasValidRouteSpatialPlacement;
-    private static bool hasValidFloodDepthSpatialPlacement;
 
     private static long spatialLossStartedTimestamp =
         long.MinValue;
@@ -183,11 +185,34 @@ public static class ARCameraSpatialController
 
     private static bool initialized;
 
+    private static long boundGraphicsGeneration;
+
     private static bool? lastLoggedTrackingValid;
     private static bool? lastLoggedAnchorAvailable;
     private static bool? lastLoggedRouteGeometry;
     private static bool? lastLoggedRouteVisible;
     private static bool? lastLoggedRouteGroundHeightPlausible;
+
+    private const float MinimumContinuityCameraHeightMeters =
+        0.50f;
+
+    private const float MaximumContinuityCameraHeightMeters =
+        2.55f;
+
+    private const long GroundHeightFailureConfirmationMilliseconds =
+        1000;
+
+    private const long GroundHeightRecoveryConfirmationMilliseconds =
+        250;
+
+    private static bool routeGroundHeightTrustInitialized;
+    private static bool routeGroundHeightTrusted;
+
+    private static long routeGroundHeightFailureStartedTimestamp =
+        long.MinValue;
+
+    private static long routeGroundHeightRecoveryStartedTimestamp =
+        long.MinValue;
 
     private static bool? lastLoggedFloodGeometry;
     private static bool? lastLoggedFloodVisible;
@@ -376,6 +401,9 @@ public static class ARCameraSpatialController
             lockedRouteVersion =
                 -1;
 
+            appliedGroundReferenceGeneration =
+                -1;
+
             lastLoggedAnchorDriftBucket =
                 -1;
 
@@ -412,6 +440,8 @@ public static class ARCameraSpatialController
             lastLoggedRouteGroundHeightPlausible =
                 null;
 
+            ResetRouteGroundHeightTrust();
+
             lastLoggedFloodGeometry =
                 null;
 
@@ -422,9 +452,6 @@ public static class ARCameraSpatialController
                 long.MinValue;
 
             hasValidRouteSpatialPlacement =
-                false;
-
-            hasValidFloodDepthSpatialPlacement =
                 false;
 
             visualContinuityHoldActive =
@@ -452,9 +479,78 @@ public static class ARCameraSpatialController
                     0,
                     "Spatial tracking is healthy.");
 
+            boundGraphicsGeneration =
+                ARRenderGenerationBridge.Current.GraphicsGeneration;
+
             initialized =
                 true;
         }
+    }
+
+    /// <summary>
+    /// Draw-thread-only reset performed before the owning Vulkan context and
+    /// Android surface are detached.
+    /// </summary>
+    public static void TeardownGraphicsGeneration(
+        long graphicsGeneration)
+    {
+        Camera3D? camera3D;
+        Entity? capsule;
+        Entity? route;
+        Entity? flood;
+
+        lock (sync)
+        {
+            if (!initialized ||
+                boundGraphicsGeneration != graphicsGeneration)
+            {
+                return;
+            }
+
+            camera3D = cameraComponent;
+            capsule = targetEntity;
+            route = routeEntity;
+            flood = floodDepthEntity;
+
+            initialized = false;
+            boundGraphicsGeneration = 0;
+            cameraTransform = null;
+            cameraComponent = null;
+            targetEntity = null;
+            targetTransform = null;
+            routeEntity = null;
+            routeTransform = null;
+            floodDepthEntity = null;
+            floodDepthTransform = null;
+            appliedVersion = -1;
+            appliedGroundReferenceGeneration = -1;
+            routeRootHorizontalLocked = false;
+            hasValidRouteSpatialPlacement = false;
+            pendingWorldCorrectionRequest =
+                RouteWorldCorrectionRequest.Unavailable;
+        }
+
+        if (capsule is not null)
+        {
+            capsule.IsEnabled = false;
+        }
+
+        if (route is not null)
+        {
+            route.IsEnabled = false;
+        }
+
+        if (flood is not null)
+        {
+            flood.IsEnabled = false;
+        }
+
+        camera3D?.ResetCustomProjection();
+
+        ARRouteRenderer.TeardownGraphicsGeneration(
+            graphicsGeneration);
+        ARFloodDepthRenderer.TeardownGraphicsGeneration(
+            graphicsGeneration);
     }
 
     public static void SetRouteRenderingEnabled(
@@ -509,6 +605,9 @@ public static class ARCameraSpatialController
             lockedRouteVersion =
                 -1;
 
+            appliedGroundReferenceGeneration =
+                -1;
+
             lastLoggedAnchorDriftBucket =
                 -1;
 
@@ -533,9 +632,6 @@ public static class ARCameraSpatialController
              * placements across that boundary.
              */
             hasValidRouteSpatialPlacement =
-                false;
-
-            hasValidFloodDepthSpatialPlacement =
                 false;
 
             visualContinuityHoldActive =
@@ -568,6 +664,8 @@ public static class ARCameraSpatialController
 
             lastLoggedRouteGroundHeightPlausible =
                 null;
+
+            ResetRouteGroundHeightTrust();
         }
 
         AndroidLog.Debug(
@@ -578,7 +676,8 @@ public static class ARCameraSpatialController
                 : reason));
     }
 
-    public static void ProcessDrawThreadWork()
+    public static void ProcessDrawThreadWork(
+        long drawGraphicsGeneration)
     {
         Transform3D? camera;
         Camera3D? camera3D;
@@ -593,7 +692,10 @@ public static class ARCameraSpatialController
 
         lock (sync)
         {
-            if (!initialized)
+            if (!initialized ||
+                boundGraphicsGeneration != drawGraphicsGeneration ||
+                !ARRenderGenerationBridge.IsCurrentGraphics(
+                    drawGraphicsGeneration))
             {
                 return;
             }
@@ -658,20 +760,45 @@ public static class ARCameraSpatialController
         long rendererRouteVersion =
             ARRouteRenderer.AppliedRouteVersion;
 
-        ARCameraPoseBridge.SpatialSnapshot frame =
-            ARCameraPoseBridge.CurrentFrame;
+        ARFrameCoherencePolicy.TryGetSpatialFrameForCurrentCamera(
+            out ARCameraPoseBridge.SpatialSnapshot frame);
+
+        ARTrackingStateBridge.TrackingSnapshot trackingSnapshot =
+            ARTrackingStateBridge.Current;
 
         bool trackingValid =
             frame.IsTracking &&
-            frame.Pose.IsTracking;
+            frame.Pose.IsTracking &&
+            trackingSnapshot.IsRenderableFor(
+                frame.Generation.SessionGeneration);
 
         ARCameraPoseBridge.AnchorSnapshot anchor =
             frame.Anchor;
 
+        if (anchor.IsAvailable &&
+            anchor.ReferenceGeneration != appliedGroundReferenceGeneration)
+        {
+            long previousGroundReferenceGeneration =
+                appliedGroundReferenceGeneration;
+
+            appliedGroundReferenceGeneration =
+                anchor.ReferenceGeneration;
+
+            routeRootHorizontalLocked = false;
+            hasValidRouteSpatialPlacement = false;
+
+            AndroidLog.Info(
+                RouteLogTag,
+                "AR GROUND REFERENCE GENERATION APPLIED: " +
+                $"previous={previousGroundReferenceGeneration}, " +
+                $"current={anchor.ReferenceGeneration}, " +
+                $"trust={anchor.Trust}. Route root requires a fresh lock.");
+        }
+
         float cameraHeightAboveGroundMeters =
             float.NaN;
 
-        bool routeGroundHeightPlausible =
+        bool rawRouteGroundHeightPlausible =
             trackingValid &&
             anchor.IsAvailable &&
             LocalArNavigationPolicy
@@ -680,10 +807,18 @@ public static class ARCameraSpatialController
                     anchor.PositionY,
                     out cameraHeightAboveGroundMeters);
 
+        bool routeGroundHeightPlausible =
+            UpdateRouteGroundHeightTrust(
+                trackingValid,
+                anchor.IsAvailable,
+                rawRouteGroundHeightPlausible,
+                cameraHeightAboveGroundMeters);
+
         LogRouteGroundHeightStateIfChanged(
             trackingValid,
             anchor,
             routeGroundHeightPlausible,
+            rawRouteGroundHeightPlausible,
             frame.Pose.PositionY,
             cameraHeightAboveGroundMeters,
             frame.Version);
@@ -789,8 +924,6 @@ public static class ARCameraSpatialController
             floodDepthRoot.IsEnabled =
                 true;
 
-            hasValidFloodDepthSpatialPlacement =
-                true;
         }
         else if (!hasFloodDepthGeometry)
         {
@@ -802,31 +935,17 @@ public static class ARCameraSpatialController
             floodDepthRoot.IsEnabled =
                 false;
 
-            hasValidFloodDepthSpatialPlacement =
-                false;
-        }
-        else if (hasValidFloodDepthSpatialPlacement &&
-                 continuity.AllowsFrozenPlacement)
-        {
-            /*
-             * Freeze the last valid AR-space water placement. The camera is
-             * frozen to its own last valid ARCore pose by the existing early
-             * return below, so the scene does not blink out during brief
-             * relocalization.
-             */
-            floodDepthRoot.IsEnabled =
-                true;
-
-            floodDepthHeldFromLastValidPlacement =
-                true;
         }
         else
         {
+            /*
+             * A non-tracking pose or unavailable anchor invalidates the last
+             * world placement immediately. Rendering a frozen placement here
+             * would turn a stale pose into apparently current guidance.
+             */
             floodDepthRoot.IsEnabled =
                 false;
 
-            hasValidFloodDepthSpatialPlacement =
-                false;
         }
 
         LogFloodDepthStateIfChanged(
@@ -1012,19 +1131,13 @@ public static class ARCameraSpatialController
                 hasValidRouteSpatialPlacement =
                     false;
             }
-            else if (hasValidRouteSpatialPlacement &&
-                     continuity.AllowsFrozenPlacement)
-            {
-                /*
-                 * Temporary camera/anchor loss: keep the route at its last
-                 * valid root transform instead of making it disappear. No
-                 * stale ARCore pose is applied.
-                 */
-                route.IsEnabled =
-                    true;
-            }
             else
             {
+                /*
+                 * Fail closed on every pose/anchor trust loss. Keeping the
+                 * previous transform visible would present stale world-locked
+                 * guidance as though it still belonged to the current frame.
+                 */
                 route.IsEnabled =
                     false;
 
@@ -1921,6 +2034,7 @@ public static class ARCameraSpatialController
         bool trackingValid,
         ARCameraPoseBridge.AnchorSnapshot anchor,
         bool heightPlausible,
+        bool rawHeightPlausible,
         float cameraWorldY,
         float cameraHeightAboveGroundMeters,
         long spatialVersion)
@@ -1947,6 +2061,7 @@ public static class ARCameraSpatialController
             "AR route ground-height validation changed: " +
             $"spatialVersion={spatialVersion}, " +
             $"plausible={heightPlausible}, " +
+            $"rawPlausible={rawHeightPlausible}, " +
             $"cameraY={cameraWorldY:F2} m, " +
             $"groundY={anchor.PositionY:F2} m, " +
             $"cameraHeight={cameraHeightAboveGroundMeters:F2} m, " +
@@ -1966,6 +2081,136 @@ public static class ARCameraSpatialController
                 message +
                 " Cyan route rendering is suppressed until a valid floor anchor is available.");
         }
+    }
+
+    private static bool UpdateRouteGroundHeightTrust(
+        bool trackingValid,
+        bool anchorAvailable,
+        bool rawHeightPlausible,
+        float cameraHeightAboveGroundMeters)
+    {
+        if (!trackingValid ||
+            !anchorAvailable)
+        {
+            routeGroundHeightFailureStartedTimestamp =
+                long.MinValue;
+
+            routeGroundHeightRecoveryStartedTimestamp =
+                long.MinValue;
+
+            return false;
+        }
+
+        long now =
+            Environment.TickCount64;
+
+        if (!routeGroundHeightTrustInitialized)
+        {
+            routeGroundHeightTrustInitialized =
+                true;
+
+            routeGroundHeightTrusted =
+                rawHeightPlausible;
+
+            return routeGroundHeightTrusted;
+        }
+
+        bool withinContinuityRange =
+            float.IsFinite(
+                cameraHeightAboveGroundMeters) &&
+            cameraHeightAboveGroundMeters >=
+                MinimumContinuityCameraHeightMeters &&
+            cameraHeightAboveGroundMeters <=
+                MaximumContinuityCameraHeightMeters;
+
+        if (routeGroundHeightTrusted)
+        {
+            routeGroundHeightRecoveryStartedTimestamp =
+                long.MinValue;
+
+            if (rawHeightPlausible ||
+                withinContinuityRange)
+            {
+                routeGroundHeightFailureStartedTimestamp =
+                    long.MinValue;
+
+                return true;
+            }
+
+            if (routeGroundHeightFailureStartedTimestamp ==
+                long.MinValue)
+            {
+                routeGroundHeightFailureStartedTimestamp =
+                    now;
+
+                return true;
+            }
+
+            if (now -
+                    routeGroundHeightFailureStartedTimestamp <
+                GroundHeightFailureConfirmationMilliseconds)
+            {
+                return true;
+            }
+
+            routeGroundHeightTrusted =
+                false;
+
+            routeGroundHeightFailureStartedTimestamp =
+                long.MinValue;
+
+            return false;
+        }
+
+        routeGroundHeightFailureStartedTimestamp =
+            long.MinValue;
+
+        if (!rawHeightPlausible)
+        {
+            routeGroundHeightRecoveryStartedTimestamp =
+                long.MinValue;
+
+            return false;
+        }
+
+        if (routeGroundHeightRecoveryStartedTimestamp ==
+            long.MinValue)
+        {
+            routeGroundHeightRecoveryStartedTimestamp =
+                now;
+
+            return false;
+        }
+
+        if (now -
+                routeGroundHeightRecoveryStartedTimestamp <
+            GroundHeightRecoveryConfirmationMilliseconds)
+        {
+            return false;
+        }
+
+        routeGroundHeightTrusted =
+            true;
+
+        routeGroundHeightRecoveryStartedTimestamp =
+            long.MinValue;
+
+        return true;
+    }
+
+    private static void ResetRouteGroundHeightTrust()
+    {
+        routeGroundHeightTrustInitialized =
+            false;
+
+        routeGroundHeightTrusted =
+            false;
+
+        routeGroundHeightFailureStartedTimestamp =
+            long.MinValue;
+
+        routeGroundHeightRecoveryStartedTimestamp =
+            long.MinValue;
     }
 
     private static void PublishTelemetry(

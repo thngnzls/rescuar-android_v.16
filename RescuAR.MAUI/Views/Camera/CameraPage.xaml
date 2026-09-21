@@ -212,6 +212,64 @@
             </Border>
 
             <Border
+                x:Name="lowLightFallbackBanner"
+                IsVisible="False"
+                ZIndex="23"
+                Margin="8,48,8,0"
+                Padding="10,8"
+                VerticalOptions="Start"
+                BackgroundColor="#FBE1E3"
+                Stroke="#F2B4BA"
+                StrokeThickness="1"
+                StrokeShape="RoundRectangle 5">
+                <Grid RowDefinitions="Auto,Auto,Auto" RowSpacing="5">
+                    <Label
+                        x:Name="lowLightFallbackTitleLabel"
+                        Text="Low light—ground route unavailable"
+                        TextColor="#B4232B"
+                        FontSize="11"
+                        FontAttributes="Bold"
+                        HorizontalTextAlignment="Center" />
+                    <Label
+                        x:Name="lowLightFallbackMessageLabel"
+                        Grid.Row="1"
+                        Text="Text guidance remains active. Open the 2D map or use the flashlight when safe."
+                        TextColor="#7A252B"
+                        FontSize="9.5"
+                        HorizontalTextAlignment="Center"
+                        LineBreakMode="WordWrap" />
+                    <Grid Grid.Row="2" ColumnDefinitions="*,*" ColumnSpacing="8">
+                        <Button
+                            x:Name="lowLightMapButton"
+                            Grid.Column="0"
+                            Text="Open 2D Map"
+                            HeightRequest="34"
+                            Padding="8,0"
+                            BackgroundColor="#0A929C"
+                            TextColor="White"
+                            FontSize="10"
+                            FontAttributes="Bold"
+                            CornerRadius="5"
+                            Clicked="OnLowLightMapClicked" />
+                        <Button
+                            x:Name="lowLightFlashlightButton"
+                            Grid.Column="1"
+                            Text="Turn On Flashlight"
+                            HeightRequest="34"
+                            Padding="8,0"
+                            BackgroundColor="#FFFFFF"
+                            BorderColor="#B4232B"
+                            BorderWidth="1"
+                            TextColor="#B4232B"
+                            FontSize="10"
+                            FontAttributes="Bold"
+                            CornerRadius="5"
+                            Clicked="OnLowLightFlashlightClicked" />
+                    </Grid>
+                </Grid>
+            </Border>
+
+            <Border
                 x:Name="turnGuidancePanel"
                 IsVisible="False"
                 InputTransparent="False"
@@ -278,6 +336,45 @@
                 </Grid>
             </Border>
 
+            <!--
+                Camera-direction locator for a valid cyan route that currently
+                lies outside the phone's view. This overlay never rotates or
+                changes route geometry; it only helps the user find the route
+                already placed in AR space.
+            -->
+            <Border
+                x:Name="routeLocatorPanel"
+                IsVisible="False"
+                InputTransparent="True"
+                ZIndex="23"
+                Margin="24,150,24,0"
+                Padding="12,8"
+                HorizontalOptions="Center"
+                VerticalOptions="Center"
+                BackgroundColor="#E8FFFFFF"
+                Stroke="#70C9D2"
+                StrokeThickness="1"
+                StrokeShape="RoundRectangle 18">
+                <Border.Shadow>
+                    <Shadow Brush="#30000000" Offset="0,2" Radius="7" Opacity="0.25" />
+                </Border.Shadow>
+                <HorizontalStackLayout Spacing="8">
+                    <Image
+                        x:Name="routeLocatorIcon"
+                        Source="lucide_arrow_up_left_teal.png"
+                        WidthRequest="24"
+                        HeightRequest="24"
+                        VerticalOptions="Center" />
+                    <Label
+                        x:Name="routeLocatorLabel"
+                        Text="Look left to find the cyan route"
+                        TextColor="#075D66"
+                        FontSize="12"
+                        FontAttributes="Bold"
+                        VerticalTextAlignment="Center" />
+                </HorizontalStackLayout>
+            </Border>
+
             <!-- ========================================================= -->
             <!-- FLOOD DEPTH SUB-TAB                                      -->
             <!-- ========================================================= -->
@@ -294,6 +391,7 @@
                 StrokeThickness="1"
                 StrokeShape="RoundRectangle 8">
                 <Label
+                    x:Name="floodWaitingLabel"
                     Text="Waiting for simulation..."
                     TextColor="#0876B9"
                     FontSize="13"
@@ -495,26 +593,14 @@
                 CornerRadius="7"
                 Clicked="OnEndNavigationClicked" />
 
-            <Button
-                x:Name="developerFloodDepthTestButton"
+            <!-- Empty in production; populated only by CameraPage.Diagnostics.cs. -->
+            <Grid
+                x:Name="diagnosticCameraActionHost"
                 IsVisible="False"
+                InputTransparent="True"
                 ZIndex="31"
-                Text="Simulate Flood Depth"
-                ImageSource="lucide_arrow_up_right_white.png"
-                ContentLayout="Left,10"
-                HeightRequest="48"
-                WidthRequest="204"
-                Margin="0,0,0,12"
-                HorizontalOptions="Center"
-                VerticalOptions="End"
-                BackgroundColor="#0A929C"
-                BorderColor="#08757D"
-                BorderWidth="1"
-                TextColor="White"
-                FontSize="14"
-                FontAttributes="Bold"
-                CornerRadius="7"
-                Clicked="OnFloodSimulationConfigureClicked" />
+                HorizontalOptions="Fill"
+                VerticalOptions="Fill" />
 
             <!-- Navigation & Awareness selector. -->
             <Border
@@ -704,41 +790,11 @@
                             </Grid>
                         </Border>
 
-                        <!-- Validated short-range developer controls remain hidden inside sheet. -->
-                        <VerticalStackLayout x:Name="arDeveloperControls" IsVisible="False" Spacing="4">
-                            <Button
-                                x:Name="developerSafeZoneTestButton"
-                                Text="DEV: Arm Safe Zone Test"
-                                IsVisible="False"
-                                HeightRequest="34"
-                                Padding="10,4"
-                                BackgroundColor="#EEF8F4"
-                                TextColor="#0C6B43"
-                                FontSize="10"
-                                CornerRadius="6"
-                                Clicked="OnDeveloperSafeZoneTestClicked" />
-                            <Button
-                                x:Name="developerTurnTestButton"
-                                IsVisible="False"
-                                Text="DEV: Validate Turn States"
-                                Clicked="OnDeveloperTurnTestClicked" />
-                            <Button
-                                x:Name="developerRerouteTestButton"
-                                IsVisible="False"
-                                Text="DEV: Simulate Off-Route Reroute"
-                                Clicked="OnDeveloperRerouteTestClicked" />
-                            <Button
-                                x:Name="developerHazardRerouteTestButton"
-                                IsVisible="False"
-                                Text="DEV: Simulate Route Hazard"
-                                HeightRequest="34"
-                                Padding="10,4"
-                                BackgroundColor="#FFF4DE"
-                                TextColor="#8A4B00"
-                                FontSize="10"
-                                CornerRadius="6"
-                                Clicked="OnDeveloperHazardRerouteTestClicked" />
-                        </VerticalStackLayout>
+                        <!-- Empty in production; diagnostic builds populate it. -->
+                        <VerticalStackLayout
+                            x:Name="diagnosticNavigationControlsHost"
+                            IsVisible="False"
+                            Spacing="4" />
                     </VerticalStackLayout>
                 </Border>
             </Grid>
@@ -880,98 +936,13 @@
                 </Border>
             </Grid>
 
-            <!-- ========================================================= -->
-            <!-- FLOOD SIMULATION CONFIGURATION SHEET                      -->
-            <!-- ========================================================= -->
+            <!-- Empty in production; diagnostic builds populate it. -->
             <Grid
-                x:Name="floodSimulationConfigurationSheet"
+                x:Name="diagnosticConfigurationHost"
                 IsVisible="False"
+                InputTransparent="True"
                 ZIndex="58"
-                VerticalOptions="End">
-                <Border
-                    Padding="14,12,14,14"
-                    BackgroundColor="White"
-                    Stroke="#E5E7E9"
-                    StrokeThickness="1"
-                    StrokeShape="RoundRectangle 10">
-                    <Border.Shadow>
-                        <Shadow Brush="#30000000" Offset="0,-3" Radius="10" Opacity="0.18" />
-                    </Border.Shadow>
-                    <VerticalStackLayout Spacing="13">
-                        <Grid ColumnDefinitions="*,30">
-                            <Label
-                                Text="Flood Depth Simulation Configuration"
-                                TextColor="#858585"
-                                FontSize="12"
-                                FontAttributes="Bold"
-                                VerticalOptions="Center" />
-                            <Border
-                                Grid.Column="1"
-                                WidthRequest="30"
-                                HeightRequest="30"
-                                BackgroundColor="Transparent"
-                                StrokeThickness="0">
-                                <Border.GestureRecognizers>
-                                    <TapGestureRecognizer Tapped="OnFloodSimulationSheetCloseClicked" />
-                                </Border.GestureRecognizers>
-                                <Image
-                                    Source="lucide_x_gray.png"
-                                    WidthRequest="16"
-                                    HeightRequest="16"
-                                    HorizontalOptions="Center"
-                                    VerticalOptions="Center" />
-                            </Border>
-                        </Grid>
-
-                        <Label
-                            Text="Flood Depth (in meters)"
-                            TextColor="#171717"
-                            FontSize="12" />
-
-                        <Grid ColumnDefinitions="*,48" ColumnSpacing="10">
-                            <Slider
-                                x:Name="floodSimulationDepthSlider"
-                                Minimum="0.1"
-                                Maximum="3.0"
-                                Value="0.6"
-                                MinimumTrackColor="#0A929C"
-                                MaximumTrackColor="#D9D9D9"
-                                ThumbColor="#0A929C"
-                                ValueChanged="OnFloodSimulationSliderChanged" />
-                            <Border
-                                Grid.Column="1"
-                                HeightRequest="34"
-                                BackgroundColor="White"
-                                Stroke="#D0D0D0"
-                                StrokeThickness="1.5"
-                                StrokeShape="RoundRectangle 8">
-                                <Label
-                                    x:Name="floodSimulationDepthValueLabel"
-                                    Text="0.6"
-                                    TextColor="#111111"
-                                    FontSize="14"
-                                    FontAttributes="Bold"
-                                    HorizontalTextAlignment="Center"
-                                    VerticalTextAlignment="Center" />
-                            </Border>
-                        </Grid>
-
-                        <Button
-                            Text="Save Changes &amp; Simulate"
-                            ImageSource="lucide_circle_check_big_white.png"
-                            ContentLayout="Left,6"
-                            HeightRequest="48"
-                            BackgroundColor="#0A929C"
-                            BorderColor="#08757D"
-                            BorderWidth="1"
-                            TextColor="White"
-                            FontSize="13"
-                            FontAttributes="Bold"
-                            CornerRadius="7"
-                            Clicked="OnSaveFloodSimulationClicked" />
-                    </VerticalStackLayout>
-                </Border>
-            </Grid>
+                VerticalOptions="Fill" />
 
             <!-- Hidden compatibility controls for existing code paths. -->
             <Grid IsVisible="False" InputTransparent="True">

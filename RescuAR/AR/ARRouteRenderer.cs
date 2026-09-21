@@ -63,12 +63,19 @@ public static class ARRouteRenderer
     private const int ArrowWingCount =
         2;
 
+    private const int OccludedDepthSamplesRequiredToHide =
+        3;
+
+    private const int ClearDepthSamplesRequiredToShow =
+        2;
+
     /*
      * The route visual has two bounded local horizons: a 40 m road-following
      * window during normal navigation and a short recovery window after
-     * verified off-course detection. The renderer still reuses a fixed pool;
-     * ordinary OSRM/A* pedestrian geometry is sparse enough that 64 segments
-     * covers either local window without per-frame allocation.
+     * verified off-course detection. The renderer reuses a measured fixed
+     * pool, while ARRouteGeometrySanitizer maps the complete local window into
+     * that budget by distance and curvature. Capacity pressure therefore
+     * reduces detail explicitly instead of cutting off the route tail.
      */
     private const int MaxRouteSegments =
         64;
@@ -77,6 +84,8 @@ public static class ARRouteRenderer
         new();
 
     private static Entity? activeRouteRoot;
+
+    private static long boundGraphicsGeneration;
 
     private static SegmentSlot[] segmentSlots =
         [];
@@ -220,6 +229,9 @@ public static class ARRouteRenderer
             activeRouteRoot =
                 routeRoot;
 
+            boundGraphicsGeneration =
+                ARRenderGenerationBridge.Current.GraphicsGeneration;
+
             segmentSlots =
                 slots;
 
@@ -265,7 +277,9 @@ public static class ARRouteRenderer
         {
             if (!ReferenceEquals(
                     activeRouteRoot,
-                    routeRoot))
+                    routeRoot) ||
+                !ARRenderGenerationBridge.IsCurrentGraphics(
+                    boundGraphicsGeneration))
             {
                 return false;
             }
@@ -279,6 +293,15 @@ public static class ARRouteRenderer
 
         ARRouteBridge.RouteSnapshot snapshot =
             ARRouteBridge.Current;
+
+        if (!ARRenderGenerationBridge.IsCurrentSession(
+                snapshot.Generation))
+        {
+            DisableAll(slots);
+            DisableAll(arrows);
+            activeSegmentCount = 0;
+            return false;
+        }
 
         if (snapshot.Version ==
             appliedRouteVersion)
@@ -338,14 +361,51 @@ public static class ARRouteRenderer
                 LogTag,
                 "Renderer rejected route geometry after removing invalid or tiny segments.");
 
+            ARRouteBridge.PublishGeometryQuality(
+                snapshot,
+                prepared,
+                0,
+                slots.Length);
+
+            return false;
+        }
+
+        if (renderPoints.Count -
+                1 >
+                    slots.Length ||
+            !prepared.FirstPointPreserved ||
+            !prepared.FinalPointPreserved)
+        {
+            DisableAll(
+                slots);
+
+            DisableAll(
+                arrows);
+
+            activeSegmentCount =
+                0;
+
+            AndroidLog.Warn(
+                LogTag,
+                "Renderer rejected route geometry that exceeded the pool or " +
+                "did not preserve both route-window endpoints: " +
+                $"preparedPoints={renderPoints.Count}, " +
+                $"segmentCapacity={slots.Length}, " +
+                $"firstPreserved={prepared.FirstPointPreserved}, " +
+                $"finalPreserved={prepared.FinalPointPreserved}.");
+
+            ARRouteBridge.PublishGeometryQuality(
+                snapshot,
+                prepared,
+                0,
+                slots.Length);
+
             return false;
         }
 
         int requestedSegmentCount =
-            Math.Min(
-                renderPoints.Count -
-                    1,
-                slots.Length);
+            renderPoints.Count -
+                1;
 
         int renderedSegmentCount =
             0;
@@ -401,6 +461,12 @@ public static class ARRouteRenderer
         activeSegmentCount =
             renderedSegmentCount;
 
+        ARRouteBridge.PublishGeometryQuality(
+            snapshot,
+            prepared,
+            renderedSegmentCount,
+            slots.Length);
+
         AndroidLog.Debug(
             LogTag,
             "Renderer applied route snapshot: " +
@@ -410,13 +476,45 @@ public static class ARRouteRenderer
             $"removedPoints={prepared.RemovedPointCount}, " +
             $"beveledCorners={prepared.BeveledCornerCount}, " +
             $"subdivisionPoints={prepared.InsertedSubdivisionPointCount}, " +
-            $"truncated={prepared.WasTruncated}, " +
+            $"capacityResampled={prepared.WasCapacityResampled}, " +
+            $"endpointPreserved=" +
+            $"{prepared.FirstPointPreserved && prepared.FinalPointPreserved}, " +
+            $"maximumSegment=" +
+            $"{prepared.MaximumRenderedSegmentLengthMeters:F2}m, " +
             $"requestedSegments={requestedSegmentCount}, " +
             $"activeSegments={activeSegmentCount}, " +
             $"forwardArrow={arrowVisible}");
 
         return activeSegmentCount >
             0;
+    }
+
+    public static void TeardownGraphicsGeneration(
+        long graphicsGeneration)
+    {
+        lock (sync)
+        {
+            if (boundGraphicsGeneration != graphicsGeneration)
+            {
+                return;
+            }
+
+            DisableAll(segmentSlots);
+            DisableAll(arrowSlots);
+
+            if (activeRouteRoot is not null)
+            {
+                activeRouteRoot.IsEnabled = false;
+            }
+
+            activeRouteRoot = null;
+            segmentSlots = [];
+            arrowSlots = [];
+            appliedRouteVersion = -1;
+            activeSegmentCount = 0;
+            boundGraphicsGeneration = 0;
+            Volatile.Write(ref depthOcclusionRequested, 0);
+        }
     }
 
     public static void SetDepthOcclusionRequested(
@@ -458,26 +556,30 @@ public static class ARRouteRenderer
         }
 
         ARDepthOcclusionBridge.DepthSnapshot depth =
-            ARDepthOcclusionBridge.Current;
+            ARFrameCoherencePolicy.GetDepthForSpatialFrame(
+                frame);
 
         ApplyCameraVisualPolicy(
             slots,
             routeRootWorldPosition,
             frame,
-            depth);
+            depth,
+            protectNearCameraSegments: true);
 
         ApplyCameraVisualPolicy(
             arrows,
             routeRootWorldPosition,
             frame,
-            depth);
+            depth,
+            protectNearCameraSegments: false);
     }
 
     private static void ApplyCameraVisualPolicy(
         SegmentSlot[] slots,
         Vector3 routeRootWorldPosition,
         ARCameraPoseBridge.SpatialSnapshot frame,
-        ARDepthOcclusionBridge.DepthSnapshot depth)
+        ARDepthOcclusionBridge.DepthSnapshot depth,
+        bool protectNearCameraSegments)
     {
         float cameraX =
             frame.Pose.PositionX;
@@ -512,6 +614,12 @@ public static class ARRouteRenderer
                 routeRootWorldPosition.Z +
                 slot.LocalMidpoint.Z;
 
+            NumericsVector3 worldMidpoint =
+                new(
+                    worldX,
+                    worldY,
+                    worldZ);
+
             float deltaX =
                 worldX -
                 cameraX;
@@ -542,20 +650,148 @@ public static class ARRouteRenderer
                     slot.Transform.LocalScale.Y,
                     slot.Transform.LocalScale.Z);
 
+            bool nearCameraExempt =
+                protectNearCameraSegments &&
+                (slot.Index ==
+                    0 ||
+                 horizontalDistance <=
+                    ARRouteVisualPolicy.NearCameraOcclusionExemptionMeters);
+
+            if (nearCameraExempt ||
+                !ARRouteVisualPolicy.IsDepthSnapshotUsable(
+                    depth,
+                    frame.FrameTimestamp))
+            {
+                ResetOcclusionState(
+                    slot,
+                    visible: true);
+
+                continue;
+            }
+
+            if (slot.LastOcclusionDepthVersion ==
+                depth.Version)
+            {
+                slot.Entity.IsEnabled =
+                    !slot.DepthOccluded;
+
+                continue;
+            }
+
+            slot.LastOcclusionDepthVersion =
+                depth.Version;
+
+            NumericsVector3 worldStart =
+                new(
+                    routeRootWorldPosition.X +
+                        slot.LocalStart.X,
+                    routeRootWorldPosition.Y +
+                        slot.LocalStart.Y,
+                    routeRootWorldPosition.Z +
+                        slot.LocalStart.Z);
+
+            NumericsVector3 worldEnd =
+                new(
+                    routeRootWorldPosition.X +
+                        slot.LocalEnd.X,
+                    routeRootWorldPosition.Y +
+                        slot.LocalEnd.Y,
+                    routeRootWorldPosition.Z +
+                        slot.LocalEnd.Z);
+
             bool occluded =
                 horizontalDistance <=
                     ARRouteVisualPolicy.MaximumOcclusionDistanceMeters &&
-                ARRouteVisualPolicy.IsWorldPointOccluded(
+                ARRouteVisualPolicy.IsWorldSegmentOccluded(
                     depth,
                     frame.FrameTimestamp,
-                    new NumericsVector3(
-                        worldX,
-                        worldY,
-                        worldZ));
+                    worldStart,
+                    worldMidpoint,
+                    worldEnd);
 
-            slot.Entity.IsEnabled =
-                !occluded;
+            UpdateOcclusionState(
+                slot,
+                occluded,
+                horizontalDistance,
+                depth.Version);
         }
+    }
+
+    private static void UpdateOcclusionState(
+        SegmentSlot slot,
+        bool occluded,
+        float horizontalDistance,
+        long depthVersion)
+    {
+        bool previousState =
+            slot.DepthOccluded;
+
+        if (occluded)
+        {
+            slot.ConsecutiveOccludedSamples++;
+            slot.ConsecutiveClearSamples =
+                0;
+
+            if (!slot.DepthOccluded &&
+                slot.ConsecutiveOccludedSamples >=
+                    OccludedDepthSamplesRequiredToHide)
+            {
+                slot.DepthOccluded =
+                    true;
+            }
+        }
+        else
+        {
+            slot.ConsecutiveClearSamples++;
+            slot.ConsecutiveOccludedSamples =
+                0;
+
+            if (slot.DepthOccluded &&
+                slot.ConsecutiveClearSamples >=
+                    ClearDepthSamplesRequiredToShow)
+            {
+                slot.DepthOccluded =
+                    false;
+            }
+        }
+
+        slot.Entity.IsEnabled =
+            !slot.DepthOccluded;
+
+        if (previousState !=
+            slot.DepthOccluded)
+        {
+            AndroidLog.Debug(
+                LogTag,
+                "ROUTE SEGMENT OCCLUSION CHANGED: " +
+                $"segment={slot.Index}, " +
+                $"hidden={slot.DepthOccluded}, " +
+                $"distance={horizontalDistance:F2}m, " +
+                $"depthVersion={depthVersion}, " +
+                $"occludedSamples={slot.ConsecutiveOccludedSamples}, " +
+                $"clearSamples={slot.ConsecutiveClearSamples}.");
+        }
+    }
+
+    private static void ResetOcclusionState(
+        SegmentSlot slot,
+        bool visible)
+    {
+        slot.DepthOccluded =
+            !visible;
+
+        slot.ConsecutiveOccludedSamples =
+            0;
+
+        slot.ConsecutiveClearSamples =
+            0;
+
+        slot.LastOcclusionDepthVersion =
+            long.MinValue;
+
+        slot.Entity.IsEnabled =
+            visible &&
+            slot.GeometryAvailable;
     }
 
     private static bool TryApplySegment(
@@ -672,14 +908,21 @@ public static class ARRouteRenderer
         slot.LocalMidpoint =
             midpoint;
 
+        slot.LocalStart =
+            startPoint;
+
+        slot.LocalEnd =
+            endPoint;
+
         slot.BaseWidthMeters =
             widthMeters;
 
         slot.GeometryAvailable =
             true;
 
-        slot.Entity.IsEnabled =
-            true;
+        ResetOcclusionState(
+            slot,
+            visible: true);
 
         return true;
     }
@@ -1020,8 +1263,9 @@ public static class ARRouteRenderer
             slots[i].GeometryAvailable =
                 false;
 
-            slots[i].Entity.IsEnabled =
-                false;
+            ResetOcclusionState(
+                slots[i],
+                visible: false);
         }
     }
 
@@ -1036,7 +1280,25 @@ public static class ARRouteRenderer
 
             Transform =
                 transform;
+
+            string name =
+                entity.Name ??
+                string.Empty;
+
+            int separatorIndex =
+                name.LastIndexOf(
+                    '_');
+
+            Index =
+                separatorIndex >= 0 &&
+                int.TryParse(
+                    name[(separatorIndex + 1)..],
+                    out int parsedIndex)
+                    ? parsedIndex
+                    : -1;
         }
+
+        public int Index { get; }
 
         public Entity Entity { get; }
 
@@ -1044,9 +1306,22 @@ public static class ARRouteRenderer
 
         public Vector3 LocalMidpoint { get; set; }
 
+        public Vector3 LocalStart { get; set; }
+
+        public Vector3 LocalEnd { get; set; }
+
         public float BaseWidthMeters { get; set; } =
             RouteWidthMeters;
 
         public bool GeometryAvailable { get; set; }
+
+        public bool DepthOccluded { get; set; }
+
+        public int ConsecutiveOccludedSamples { get; set; }
+
+        public int ConsecutiveClearSamples { get; set; }
+
+        public long LastOcclusionDepthVersion { get; set; } =
+            long.MinValue;
     }
 }

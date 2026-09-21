@@ -24,8 +24,6 @@ namespace RescuAR.App.Views.Camera;
 /// </summary>
 public sealed class FloodDepthOcclusionView : SKCanvasView
 {
-    private const int TargetMaskWidthPixels = 120;
-    private const int TargetRefreshMilliseconds = 100;
 
     private const string LogTag = "RescuAR-FloodDepth";
 
@@ -33,6 +31,11 @@ public sealed class FloodDepthOcclusionView : SKCanvasView
     private const ushort MaximumTrustedDepthMillimeters = 8000;
 
     private const float SurfaceTransitionMeters = 0.06f;
+
+    private const byte EstimatedFloodMaximumAlpha = 56;
+
+    private const float MaximumGroundCorrectionPerDepthFrameMeters =
+        0.08f;
 
     private static readonly SKColor FloodColor =
         new(0x00, 0xA6, 0xC8, 104);
@@ -77,6 +80,14 @@ public sealed class FloodDepthOcclusionView : SKCanvasView
     private bool depthActiveLogged;
     private long lastLoggedFloodVersion = -1;
 
+    private bool hasDisplayedGroundWorldY;
+    private float displayedGroundWorldY;
+    private bool? lastLoggedGroundWasProvisional;
+
+    private long maskStorageAllocationCount;
+    private long mappingAllocationCount;
+    private long lastAllocationMetricsLogTimestamp = long.MinValue;
+
     public FloodDepthOcclusionView()
     {
         InputTransparent = true;
@@ -98,7 +109,8 @@ public sealed class FloodDepthOcclusionView : SKCanvasView
         requestedFloodVersion = long.MinValue;
 
         redrawTimer = Dispatcher.CreateTimer();
-        redrawTimer.Interval = TimeSpan.FromMilliseconds(TargetRefreshMilliseconds);
+        redrawTimer.Interval = TimeSpan.FromMilliseconds(
+            ARPowerThermalPolicy.CurrentDecision.FloodRefreshMilliseconds);
         redrawTimer.IsRepeating = true;
         redrawTimer.Tick += OnRedrawTimerTick;
         redrawTimer.Start();
@@ -121,11 +133,29 @@ public sealed class FloodDepthOcclusionView : SKCanvasView
 
     private void OnRedrawTimerTick(object? sender, EventArgs e)
     {
+        ARPowerThermalPolicy.WorkloadDecision workload =
+            ARPowerThermalPolicy.CurrentDecision;
+
+        if (redrawTimer is not null)
+        {
+            TimeSpan desiredInterval = TimeSpan.FromMilliseconds(
+                workload.FloodRefreshMilliseconds);
+
+            if (redrawTimer.Interval != desiredInterval)
+            {
+                redrawTimer.Interval = desiredInterval;
+            }
+        }
+
         ARFloodDepthBridge.FloodDepthSnapshot flood =
             ARFloodDepthBridge.Current;
 
         ARDepthOcclusionBridge.DepthSnapshot depth =
-            ARDepthOcclusionBridge.Current;
+            ARFrameCoherencePolicy.TryGetSpatialFrameForCurrentCamera(
+                out ARCameraPoseBridge.SpatialSnapshot spatialFrame)
+                ? ARFrameCoherencePolicy.GetDepthForSpatialFrame(
+                    spatialFrame)
+                : ARDepthOcclusionBridge.DepthSnapshot.Unavailable;
 
         // Avoid a paint pass when nothing changed. With V7.3 the depth bridge
         // publishes at <=10 Hz, so the UI cannot accidentally spin at the
@@ -157,19 +187,29 @@ public sealed class FloodDepthOcclusionView : SKCanvasView
         {
             renderedFloodVersion = -1;
             renderedDepthVersion = -1;
+            hasDisplayedGroundWorldY = false;
             return;
         }
 
         ARDepthOcclusionBridge.DepthSnapshot depth =
-            ARDepthOcclusionBridge.Current;
+            ARFrameCoherencePolicy.TryGetSpatialFrameForCurrentCamera(
+                out ARCameraPoseBridge.SpatialSnapshot spatialFrame)
+                ? ARFrameCoherencePolicy.GetDepthForSpatialFrame(
+                    spatialFrame)
+                : ARDepthOcclusionBridge.DepthSnapshot.Unavailable;
 
         if (!depth.IsAvailable ||
             !depth.GroundAvailable ||
+            flood.GroundTrust == ARGroundTrust.None ||
+            flood.GroundReferenceGeneration !=
+                depth.GroundReferenceGeneration ||
+            flood.GroundTrust != depth.GroundTrust ||
             depth.DepthMillimeters.Length < depth.Width * depth.Height ||
             depth.ViewToTextureUv.Length < 8)
         {
             // Never show an unoccluded fallback. Until a trustworthy ARCore
             // depth snapshot exists, transparent is safer than a false level.
+            hasDisplayedGroundWorldY = false;
             return;
         }
 
@@ -219,7 +259,7 @@ public sealed class FloodDepthOcclusionView : SKCanvasView
         // previous 160 px mask on the Galaxy A54 field device.
         int maskWidth =
             Math.Min(
-                TargetMaskWidthPixels,
+                ARPowerThermalPolicy.CurrentDecision.FloodMaskWidthPixels,
                 Math.Max(1, canvasWidth));
 
         int maskHeight =
@@ -243,8 +283,17 @@ public sealed class FloodDepthOcclusionView : SKCanvasView
             return;
         }
 
+        float renderedGroundWorldY =
+            GetSmoothedGroundWorldY(
+                depth.GroundWorldY);
+
         float waterSurfaceWorldY =
-            depth.GroundWorldY + floodDepthMeters;
+            renderedGroundWorldY + floodDepthMeters;
+
+        byte maximumFloodAlpha =
+            depth.GroundIsProvisional
+                ? EstimatedFloodMaximumAlpha
+                : FloodColor.Alpha;
 
         Quaternion cameraRotation =
             Quaternion.Normalize(
@@ -318,9 +367,9 @@ public sealed class FloodDepthOcclusionView : SKCanvasView
 
             int alpha =
                 Math.Clamp(
-                    (int)MathF.Round(FloodColor.Alpha * visibility),
+                    (int)MathF.Round(maximumFloodAlpha * visibility),
                     0,
-                    FloodColor.Alpha);
+                    maximumFloodAlpha);
 
             maskPixels[i] = FloodColorsByAlpha[alpha];
 
@@ -333,10 +382,14 @@ public sealed class FloodDepthOcclusionView : SKCanvasView
         maskBitmap.Pixels = maskPixels;
 
         if (!depthActiveLogged ||
-            lastLoggedFloodVersion != floodVersion)
+            lastLoggedFloodVersion != floodVersion ||
+            lastLoggedGroundWasProvisional !=
+                depth.GroundIsProvisional)
         {
             depthActiveLogged = true;
             lastLoggedFloodVersion = floodVersion;
+            lastLoggedGroundWasProvisional =
+                depth.GroundIsProvisional;
 
             float tintedPercent =
                 pixelCount > 0
@@ -349,14 +402,47 @@ public sealed class FloodDepthOcclusionView : SKCanvasView
                 $"floodVersion={floodVersion}, " +
                 $"depthFrameVersion={depth.Version}, " +
                 $"depth={floodDepthMeters:F2} m, " +
-                $"groundWorldY={depth.GroundWorldY:F3} m, " +
+                $"groundMode={(depth.GroundIsProvisional ? "PROVISIONAL_ESTIMATE" : "VERIFIED")}, " +
+                $"targetGroundWorldY={depth.GroundWorldY:F3} m, " +
+                $"renderedGroundWorldY={renderedGroundWorldY:F3} m, " +
                 $"surfaceWorldY={waterSurfaceWorldY:F3} m, " +
                 $"cameraWorldY={cameraWorldY:F3} m, " +
                 $"mask={maskWidth}x{maskHeight}, " +
                 $"tinted={tintedPercent:F1}%, " +
                 $"cameraBelowSimulatedSurface={cameraBelowSimulatedSurface}, " +
-                "refreshCap=10Hz, mode=OBSERVER_DEPTH_CLASSIFICATION_PERFORMANCE.");
+                $"maximumAlpha={maximumFloodAlpha}, " +
+                $"refreshMilliseconds={ARPowerThermalPolicy.CurrentDecision.FloodRefreshMilliseconds}, " +
+                "mode=OBSERVER_DEPTH_CLASSIFICATION_PERFORMANCE.");
         }
+    }
+
+    private float GetSmoothedGroundWorldY(
+        float targetGroundWorldY)
+    {
+        if (!hasDisplayedGroundWorldY ||
+            !float.IsFinite(
+                displayedGroundWorldY))
+        {
+            displayedGroundWorldY =
+                targetGroundWorldY;
+
+            hasDisplayedGroundWorldY =
+                true;
+
+            return displayedGroundWorldY;
+        }
+
+        float correction =
+            targetGroundWorldY -
+            displayedGroundWorldY;
+
+        displayedGroundWorldY +=
+            Math.Clamp(
+                correction,
+                -MaximumGroundCorrectionPerDepthFrameMeters,
+                MaximumGroundCorrectionPerDepthFrameMeters);
+
+        return displayedGroundWorldY;
     }
 
     private void EnsureSampleMapping(
@@ -395,6 +481,8 @@ public sealed class FloodDepthOcclusionView : SKCanvasView
         cachedRayX = new float[pixelCount];
         cachedRayY = new float[pixelCount];
         cachedSampleValid = new bool[pixelCount];
+        mappingAllocationCount++;
+        LogAllocationMetricsIfNeeded();
 
         float[] uv = depth.ViewToTextureUv;
 
@@ -592,6 +680,28 @@ public sealed class FloodDepthOcclusionView : SKCanvasView
                 SKAlphaType.Premul);
 
         maskPixels = new SKColor[width * height];
+        maskStorageAllocationCount++;
+        LogAllocationMetricsIfNeeded();
+    }
+
+    private void LogAllocationMetricsIfNeeded()
+    {
+        long now = Environment.TickCount64;
+
+        if (lastAllocationMetricsLogTimestamp != long.MinValue &&
+            now - lastAllocationMetricsLogTimestamp < 30_000)
+        {
+            return;
+        }
+
+        lastAllocationMetricsLogTimestamp = now;
+
+        AndroidLog.Info(
+            LogTag,
+            "ARCORE_FLOOD_MASK_ALLOCATION_METRICS " +
+            $"maskStorageAllocations={maskStorageAllocationCount}; " +
+            $"mappingAllocations={mappingAllocationCount}; " +
+            $"workloadMode={ARPowerThermalPolicy.CurrentDecision.Mode}.");
     }
 
     private void DisposeMask()
@@ -621,6 +731,9 @@ public sealed class FloodDepthOcclusionView : SKCanvasView
         requestedFloodVersion = long.MinValue;
         depthActiveLogged = false;
         lastLoggedFloodVersion = -1;
+        hasDisplayedGroundWorldY = false;
+        displayedGroundWorldY = 0.0f;
+        lastLoggedGroundWasProvisional = null;
     }
 
     private void DisposeBitmapOnly()

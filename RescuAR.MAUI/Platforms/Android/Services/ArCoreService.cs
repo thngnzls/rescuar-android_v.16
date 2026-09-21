@@ -1,4 +1,3 @@
-using Android.App;
 using Android.Content;
 using Android.Hardware;
 using Android.Util;
@@ -19,17 +18,25 @@ public sealed partial class ArCoreService : IArCoreService
         "RescuAR-ARCore";
 
     private readonly Context context;
-    private readonly Activity activity;
-
     /*
-     * Prevents the automatic frame loop and the existing manual Update()
-     * button path from calling Session.Update() at the same time.
+     * Serializes the automatic frame loop with lifecycle, camera-control,
+     * recovery, and display-geometry session calls.
      *
      * Display-geometry changes are also applied while this gate is held so
      * Session.SetDisplayGeometry() and Session.Update() do not race.
      */
     private readonly SemaphoreSlim updateGate =
         new(1, 1);
+
+    private const int FrameUpdateGateTimeoutMilliseconds =
+        500;
+
+    private const long FrameDropLogIntervalMilliseconds =
+        5_000;
+
+    private long droppedSerializedFrameCount;
+    private long lastFrameDropLogTimestamp =
+        long.MinValue;
 
     /*
      * Serializes Camera-tab pause/resume transitions.
@@ -50,9 +57,14 @@ public sealed partial class ArCoreService : IArCoreService
     private readonly object displayGeometryLock =
         new();
 
-    private Session? session;
-    private VKGraphicsContext? graphicsContext;
-    private ARCoreVulkanImporter? importer;
+    private volatile Session? session;
+    private volatile VKGraphicsContext? graphicsContext;
+    private IArCameraFrameImporter? importer;
+    private Exception? lastSessionOperationException;
+    private readonly object graphicsTeardownLock = new();
+    private Task? graphicsTeardownTask;
+    private long graphicsTeardownGeneration;
+    private VKGraphicsContext? graphicsTeardownContext;
 
     /*
      * Latest-frame handoff between the ARCore worker and Evergine's draw
@@ -68,7 +80,7 @@ public sealed partial class ArCoreService : IArCoreService
     private PendingCameraFrame? pendingCameraFrame;
 
     private CancellationTokenSource? frameLoopCancellation;
-    private Task? frameLoopTask;
+    private volatile Task? frameLoopTask;
 
     private bool hasInspectedHardwareBuffer;
 
@@ -114,6 +126,8 @@ public sealed partial class ArCoreService : IArCoreService
 
     private bool displayGeometryAvailable;
     private bool displayGeometryDirty;
+    private long requestedDisplayGeometryGeneration;
+    private long appliedDisplayGeometryGeneration;
 
     /*
      * VIEW_NORMALIZED coordinates for the four corners used by our Vulkan
@@ -167,11 +181,6 @@ public sealed partial class ArCoreService : IArCoreService
 
     private bool depthOcclusionAvailabilityLogged;
 
-#if DEBUG
-    private long lastDepthOcclusionWaitingLogTimestamp =
-        long.MinValue;
-#endif
-
     private long processedFrameCount;
     private long fpsWindowStartTimestamp =
         Environment.TickCount64;
@@ -180,7 +189,7 @@ public sealed partial class ArCoreService : IArCoreService
         "RescuAR-ARPose";
 
     /*
-     * GROUND ACQUISITION V4
+     * GROUND ACQUISITION V5
      * ---------------------
      * Prefer a real upward-facing ARCore Plane whenever one is available.
      * On Depth-capable devices, a lower-center DepthPoint acts as a fallback
@@ -190,6 +199,11 @@ public sealed partial class ArCoreService : IArCoreService
      * Depth fallback is intentionally conservative: the candidate must be
      * below the camera, approximately horizontal, and supported by a rolling
      * confidence window before an Anchor is created.
+     *
+     * When several sweeps contain no DepthPoint, intermediate sweeps retain
+     * only the lower-center probe. A complete nine-ray Plane/Depth sweep still
+     * runs every sixth interval. This limits ARCore's repeated
+     * depth-not-yet-available work without stopping floor verification.
      */
     private static readonly (float XOffset, float ZOffset)[]
         GroundPlaneWorldDownSearchPattern =
@@ -211,17 +225,22 @@ public sealed partial class ArCoreService : IArCoreService
 
     private static readonly (float X, float Y)[] GroundPlaneSearchPattern =
     {
-        // First sample is also the DepthPoint confidence sample.
-        (0.50f, 0.80f),
+        /*
+         * Keep the primary confidence ray in the bottom-center camera region.
+         * A normally held phone can therefore see enough floor for acquisition
+         * without requiring the user to point the whole camera downward. Keep
+         * every ray clear of ARCore's unreliable bottom-edge hit-test margin.
+         */
+        (0.50f, 0.84f),
 
-        // Additional lower-view samples are Plane-only fallbacks.
-        (0.34f, 0.76f),
-        (0.66f, 0.76f),
-        (0.50f, 0.90f)
+        // Nearby Plane probes provide same-frame spatial verification.
+        (0.34f, 0.82f),
+        (0.66f, 0.82f),
+        (0.50f, 0.76f)
     };
 
-    private const int GroundDepthCandidateSampleIndex =
-        0;
+    private const int GroundDepthCandidateSampleCount = 3;
+    private const int GroundDepthRequiredSpatialSamples = 2;
 
     private const long GroundPlaneSearchIntervalMilliseconds =
         250;
@@ -234,6 +253,12 @@ public sealed partial class ArCoreService : IArCoreService
 
     private const int GroundDepthValidSweepsRequired =
         3;
+
+    private const int GroundDepthUnavailableSweepsBeforeReducedProbing =
+        3;
+
+    private const int GroundReducedProbeFullSweepCadence =
+        6;
 
     private const float GroundDepthMinimumNormalY =
         0.70f;
@@ -253,6 +278,26 @@ public sealed partial class ArCoreService : IArCoreService
     private const float GroundPlaneMinimumSampleSeparationMeters =
         0.30f;
 
+    /*
+     * EMERGENCY STARTUP FLOOR ESTIMATE
+     * --------------------------------
+     * ARCore Plane growth can take 10-16 seconds on glossy or repetitive
+     * indoor floors. After a short verified-tracking interval, publish a
+     * fixed camera-relative floor estimate so provisional ground-referenced
+     * guidance can begin
+     * without waiting for Plane polygon growth. Real Plane/Depth acquisition
+     * continues unchanged in the background and always replaces this estimate.
+     *
+     * The value approximates a hand-held phone height. It is deliberately a
+     * presentation reference, never an ARCore Anchor and never evidence that
+     * the physical floor has been verified.
+     */
+    private const long ProvisionalGroundDelayMilliseconds =
+        1500;
+
+    private const float ProvisionalCameraHeightMeters =
+        1.35f;
+
     private long nextGroundPlaneSearchTimestamp =
         long.MinValue;
 
@@ -269,6 +314,11 @@ public sealed partial class ArCoreService : IArCoreService
     private bool depthModeSupported;
 
     private bool depthModeEnabled;
+
+    private bool forceDepthDisabledForExperiment;
+
+    private string depthExperimentMode =
+        "DEPTH_ON_DEMAND";
 
     /*
      * Updated by the spatial-pose path on every tracked frame. Depth remains
@@ -290,6 +340,13 @@ public sealed partial class ArCoreService : IArCoreService
     private int groundDepthConfidenceWindowCount;
     private int groundDepthConfidenceWindowIndex;
     private int groundDepthConfidenceValidSweepCount;
+    private int groundDepthUnavailableSweepCount;
+
+    private bool groundDepthConfidenceRecordedThisSweep;
+    private int groundDepthSweepSupportCount;
+    private float groundDepthSweepCandidateX;
+    private float groundDepthSweepCandidateY;
+    private float groundDepthSweepCandidateZ;
 
     private bool hasGroundPlaneSweepCandidate;
     private float groundPlaneSweepCandidateX;
@@ -308,6 +365,19 @@ public sealed partial class ArCoreService : IArCoreService
         1000.0f;
 
     private Google.AR.Core.Anchor? spatialGroundAnchor;
+
+    private bool hasProvisionalGroundReference;
+
+    private float provisionalGroundX;
+    private float provisionalGroundY;
+    private float provisionalGroundZ;
+
+    private int isGroundAnchorProvisional;
+
+    public bool IsGroundAnchorProvisional =>
+        Volatile.Read(
+            ref isGroundAnchorProvisional) ==
+                1;
 
     /*
      * Ground-anchor recovery is owned exclusively by
@@ -333,9 +403,6 @@ public sealed partial class ArCoreService : IArCoreService
     public bool IsSessionPaused =>
         sessionPaused;
 
-    public Session? Session =>
-        session;
-
     public bool IsInitialized =>
         session is not null;
 
@@ -348,17 +415,15 @@ public sealed partial class ArCoreService : IArCoreService
         context =
             global::Android.App.Application.Context;
 
-        activity =
-            Platform.CurrentActivity
-            ?? throw new InvalidOperationException(
-                "Current Android Activity is unavailable.");
+        AndroidBuildManifestReporter.LogOnce(
+            context);
 
         Log.Debug(
             Tag,
             "ArCoreService constructed.");
     }
 
-    public ArCoreApk.Availability CheckAvailability()
+    private ArCoreApk.Availability CheckAvailabilityCore()
     {
         Log.Debug(
             Tag,
@@ -392,27 +457,12 @@ public sealed partial class ArCoreService : IArCoreService
         return availability;
     }
 
-    public ArCoreApk.InstallStatus RequestInstall()
+    private bool InitializeSessionCore(
+        ArCoreApk.Availability availability)
     {
-        Log.Debug(
-            Tag,
-            "Requesting ARCore installation...");
+        lastSessionOperationException =
+            null;
 
-        ArCoreApk.InstallStatus installStatus =
-            ArCoreApk.Instance
-                .RequestInstall(
-                    activity,
-                    true);
-
-        Log.Debug(
-            Tag,
-            $"ARCore Install Status: {installStatus}");
-
-        return installStatus;
-    }
-
-    public bool Initialize()
-    {
         Log.Debug(
             Tag,
             "========================================");
@@ -425,73 +475,11 @@ public sealed partial class ArCoreService : IArCoreService
             Tag,
             "========================================");
 
-        if (session is not null)
-        {
-            Log.Debug(
-                Tag,
-                "ARCore Session already exists.");
-
-            return true;
-        }
-
         try
         {
             Log.Debug(
                 Tag,
-                "STEP 1: Checking ARCore availability.");
-
-            ArCoreApk.Availability availability =
-                CheckAvailability();
-
-            if (availability.IsUnsupported)
-            {
-                Log.Error(
-                    Tag,
-                    "ARCore is unsupported on this device.");
-
-                return false;
-            }
-
-            Log.Debug(
-                Tag,
-                "STEP 2: Requesting ARCore installation.");
-
-            ArCoreApk.InstallStatus installStatus =
-                RequestInstall();
-
-            if (installStatus ==
-                ArCoreApk.InstallStatus.InstallRequested)
-            {
-                Log.Warn(
-                    Tag,
-                    "ARCore installation was requested.");
-
-                Log.Warn(
-                    Tag,
-                    "Initialization must be attempted again " +
-                    "after installation.");
-
-                return false;
-            }
-
-            if (installStatus !=
-                ArCoreApk.InstallStatus.Installed)
-            {
-                Log.Error(
-                    Tag,
-                    $"Unexpected ARCore install status: " +
-                    $"{installStatus}");
-
-                return false;
-            }
-
-            Log.Debug(
-                Tag,
-                "ARCore installation status: INSTALLED.");
-
-            Log.Debug(
-                Tag,
-                "STEP 3: Creating ARCore Session.");
+                "Creating ARCore Session on the serialized session worker.");
 
             session =
                 new Session(
@@ -501,10 +489,7 @@ public sealed partial class ArCoreService : IArCoreService
                 Tag,
                 "ARCore Session created successfully.");
 
-            InspectSupportedCameraConfigurations(
-                session);
-
-            SelectThirtyFpsCameraConfig(
+            SelectProductionCameraConfiguration(
                 session);
 
             /*
@@ -571,13 +556,22 @@ public sealed partial class ArCoreService : IArCoreService
                 Tag,
                 "STEP 8: Configuring DepthMode when supported.");
 
+            forceDepthDisabledForExperiment =
+                IsDepthDisabledForControlledRetest();
+
+            depthExperimentMode =
+                forceDepthDisabledForExperiment
+                    ? "FORCED_DEPTH_OFF"
+                    : "DEPTH_ON_DEMAND";
+
             depthModeSupported =
                 TryConfigureAutomaticDepth(
                     session,
                     config);
 
             depthModeEnabled =
-                depthModeSupported;
+                depthModeSupported &&
+                !forceDepthDisabledForExperiment;
 
             Log.Debug(
                 Tag,
@@ -590,11 +584,13 @@ public sealed partial class ArCoreService : IArCoreService
                 Tag,
                 "ARCore configuration applied successfully.");
 
+            LogDeviceCompatibilityProfile(
+                session,
+                availability);
+
             Log.Debug(
                 Tag,
                 "STEP 10: Applying initial display geometry.");
-
-            TryCaptureInitialDisplayGeometry();
 
             ApplyDisplayGeometryIfNeeded(
                 session);
@@ -631,6 +627,10 @@ public sealed partial class ArCoreService : IArCoreService
             hasLoggedGroundPlaneSearch =
                 false;
 
+            ResetGroundProbeSessionBudget();
+
+            ResetDepthRetryPolicy();
+
             ResetGroundPlaneSearchState();
 
             lastSpatialPoseTelemetryLogTimestamp =
@@ -657,12 +657,6 @@ public sealed partial class ArCoreService : IArCoreService
 
             Log.Debug(
                 Tag,
-                "STEP 11: Starting automatic ARCore frame loop.");
-
-            StartFrameLoop();
-
-            Log.Debug(
-                Tag,
                 "========================================");
 
             Log.Debug(
@@ -677,259 +671,16 @@ public sealed partial class ArCoreService : IArCoreService
         }
         catch (Exception exception)
         {
+            lastSessionOperationException =
+                exception;
+
             Log.Error(
                 Tag,
                 $"ARCore initialization FAILED: {exception}");
 
-            StopFrameLoop();
-
             CloseSessionAfterFailure();
 
             return false;
-        }
-    }
-
-    /// <summary>
-    /// Temporarily releases the physical ARCore camera when the Camera tab is
-    /// hidden while preserving the ARCore Session, current spatial anchor,
-    /// Vulkan importer, and navigation/guidance state.
-    /// </summary>
-    public async Task PauseCameraSessionAsync()
-    {
-        await lifecycleGate
-            .WaitAsync()
-            .ConfigureAwait(false);
-
-        try
-        {
-            Session? currentSession =
-                session;
-
-            if (currentSession is null)
-            {
-                return;
-            }
-
-            if (sessionPaused)
-            {
-                Log.Debug(
-                    Tag,
-                    "ARCore camera session is already paused.");
-
-                return;
-            }
-
-            Log.Debug(
-                Tag,
-                "Pausing ARCore camera session...");
-
-            /*
-             * Cancel new automatic updates first. Session.Update() itself is
-             * blocking, so wait for the worker to finish its current update
-             * before calling Session.Pause().
-             */
-            CancellationTokenSource? cancellation =
-                frameLoopCancellation;
-
-            Task? runningTask =
-                frameLoopTask;
-
-            if (cancellation is not null)
-            {
-                try
-                {
-                    cancellation.Cancel();
-                }
-                catch (ObjectDisposedException)
-                {
-                    // Already being cleaned up.
-                }
-            }
-
-            if (runningTask is not null)
-            {
-                try
-                {
-                    await runningTask
-                        .ConfigureAwait(false);
-                }
-                catch (OperationCanceledException)
-                {
-                    // Expected during normal Camera-tab shutdown.
-                }
-            }
-
-            frameLoopTask =
-                null;
-
-            frameLoopCancellation =
-                null;
-
-            cancellation?.Dispose();
-
-            /*
-             * Final barrier against the manual Update() path. The spatial
-             * anchor is intentionally retained; only the pending camera frame
-             * is released.
-             */
-            await updateGate
-                .WaitAsync()
-                .ConfigureAwait(false);
-
-            try
-            {
-                ReleasePendingCameraFrame();
-
-                ARCameraTextureBridge.Clear();
-
-                currentSession.Pause();
-
-                sessionPaused =
-                    true;
-
-                /*
-                 * The anchor is intentionally retained across the pause.
-                 * A recovery grace period is started only after Session.Resume().
-                 */
-            }
-            finally
-            {
-                updateGate.Release();
-            }
-
-            Log.Debug(
-                Tag,
-                "ARCore camera session paused. Physical camera released; " +
-                "ARCore Session and guidance state retained.");
-        }
-        finally
-        {
-            lifecycleGate.Release();
-        }
-    }
-
-    /// <summary>
-    /// Reopens the physical camera and restarts ARCore frame production when
-    /// the Camera tab becomes visible again. The existing Session and spatial
-    /// anchor are reused so ongoing guidance is not cancelled.
-    /// </summary>
-    public async Task<bool> ResumeCameraSessionAsync()
-    {
-        await lifecycleGate
-            .WaitAsync()
-            .ConfigureAwait(false);
-
-        try
-        {
-            Session? currentSession =
-                session;
-
-            if (currentSession is null)
-            {
-                Log.Warn(
-                    Tag,
-                    "Cannot resume ARCore camera because Session is null.");
-
-                return false;
-            }
-
-            if (!sessionPaused)
-            {
-                StartFrameLoop();
-
-                Log.Debug(
-                    Tag,
-                    "ARCore camera session is already resumed.");
-
-                return true;
-            }
-
-            Log.Debug(
-                Tag,
-                "Resuming ARCore camera session...");
-
-            await updateGate
-                .WaitAsync()
-                .ConfigureAwait(false);
-
-            try
-            {
-                /*
-                 * The Evergine viewport may have changed while Camera was
-                 * hidden. Apply any pending geometry before reopening camera
-                 * frame production.
-                 */
-                ApplyDisplayGeometryIfNeeded(
-                    currentSession);
-
-                currentSession.Resume();
-
-                sessionPaused =
-                    false;
-
-                /*
-                 * Retain the current AR anchor across Session.Resume(). The
-                 * queued recovery component gives PAUSED anchors a generous
-                 * relocalization grace period and only replaces a truly stale
-                 * anchor.
-                 */
-                InvalidatePendingRecoveryCountdown();
-
-                hasLoggedGroundPlaneSearch =
-                    false;
-
-                /*
-                 * Treat the next frame as the start of a fresh camera stream.
-                 */
-                lastProcessedTimestamp =
-                    long.MinValue;
-
-                processedFrameCount =
-                    0;
-
-                fpsWindowStartTimestamp =
-                    Environment.TickCount64;
-
-                hasLoggedTransformedUv =
-                    false;
-
-                lastSpatialPoseTelemetryLogTimestamp =
-                    long.MinValue;
-
-                lastLoggedTrackingState =
-                    null;
-
-                lastLoggedTrackingFailureReason =
-                    null;
-            }
-            catch (Exception exception)
-            {
-                sessionPaused =
-                    true;
-
-                Log.Error(
-                    Tag,
-                    $"Unable to resume ARCore camera session: {exception}");
-
-                return false;
-            }
-            finally
-            {
-                updateGate.Release();
-            }
-
-            StartFrameLoop();
-
-            Log.Debug(
-                Tag,
-                "ARCore camera session resumed. Existing AR guidance state " +
-                "was retained.");
-
-            return true;
-        }
-        finally
-        {
-            lifecycleGate.Release();
         }
     }
 
@@ -999,6 +750,8 @@ public sealed partial class ArCoreService : IArCoreService
 
             displayGeometryDirty =
                 true;
+
+            requestedDisplayGeometryGeneration++;
         }
 
         hasLoggedTransformedUv =
@@ -1012,43 +765,64 @@ public sealed partial class ArCoreService : IArCoreService
             $"height={height}");
     }
 
-    public Frame? Update()
-    {
-        if (sessionPaused)
-        {
-            Log.Debug(
-                Tag,
-                "Manual Update() ignored because the ARCore Session is paused.");
-
-            return null;
-        }
-
-        if (IsFrameLoopRunning)
-        {
-            Log.Debug(
-                Tag,
-                "Manual Update() ignored because the automatic " +
-                "ARCore frame loop is running.");
-
-            return null;
-        }
-
-        return UpdateFrameSerialized(
-            fromAutomaticLoop: false,
-            CancellationToken.None);
-    }
-
-    public void SetGraphicsContext(
+    public long SetGraphicsContext(
         VKGraphicsContext graphicsContext)
     {
         ArgumentNullException.ThrowIfNull(
             graphicsContext);
 
-        this.graphicsContext =
-            graphicsContext;
+        long registeredGraphicsGeneration;
 
-        ARCameraTextureBridge.SetDrawThreadProcessor(
-            ProcessPendingCameraFrameOnDrawThread);
+        lock (graphicsTeardownLock)
+        {
+            VKGraphicsContext? existingContext =
+                this.graphicsContext;
+
+            if (ReferenceEquals(existingContext, graphicsContext))
+            {
+                return Interlocked.Read(ref graphicsGeneration);
+            }
+
+            if (existingContext is not null ||
+                (graphicsTeardownTask is not null &&
+                 !graphicsTeardownTask.IsCompleted) ||
+                importer is not null)
+            {
+                throw new InvalidOperationException(
+                    "The previous Vulkan graphics context has not completed " +
+                    "its acknowledged draw-thread teardown.");
+            }
+
+            this.graphicsContext = graphicsContext;
+
+            registeredGraphicsGeneration =
+                RegisterGraphicsContextGeneration();
+
+            ResetCameraPipelineForGraphicsGeneration(
+                registeredGraphicsGeneration);
+
+            ARRenderGenerationBridge.RegisterGraphicsContext(
+                registeredGraphicsGeneration);
+
+            ARCameraTextureBridge.SetDrawThreadProcessor(
+                registeredGraphicsGeneration,
+                ProcessPendingCameraFrameOnDrawThread);
+        }
+
+        ActivateRenderGenerationIfReady();
+
+        bool shouldResume;
+        lock (lifecycleStateLock)
+        {
+            shouldResume =
+                activityIsResumed &&
+                (resumeAfterGraphicsRecreation ||
+                 desiredLifecycleState == ArCoreLifecycleTarget.Running);
+            if (shouldResume)
+            {
+                resumeAfterGraphicsRecreation = false;
+            }
+        }
 
         Log.Debug(
             Tag,
@@ -1065,9 +839,272 @@ public sealed partial class ArCoreService : IArCoreService
         Log.Debug(
             Tag,
             $"VkDevice = 0x{graphicsContext.VkDevice.Handle:X}");
+
+        if (shouldResume)
+        {
+            TrackTransition(
+                EnsureRunningAsync(),
+                "Evergine graphics context became available");
+        }
+
+        return registeredGraphicsGeneration;
     }
 
-    private void StartFrameLoop()
+    /// <summary>
+    /// Rejects new AR frames and completes the old graphics generation on the
+    /// Evergine draw thread before the Android handler detaches its surface.
+    /// Repeated Closing/Disconnect callbacks share the same acknowledgement.
+    /// </summary>
+    public Task QuiesceGraphicsContextAsync(
+        VKGraphicsContext unavailableContext,
+        long unavailableGraphicsGeneration,
+        string reason)
+    {
+        ArgumentNullException.ThrowIfNull(unavailableContext);
+
+        lock (graphicsTeardownLock)
+        {
+            if (graphicsTeardownTask is not null &&
+                graphicsTeardownGeneration == unavailableGraphicsGeneration)
+            {
+                return graphicsTeardownTask;
+            }
+
+            if (!ReferenceEquals(graphicsContext, unavailableContext) ||
+                Interlocked.Read(ref graphicsGeneration) !=
+                    unavailableGraphicsGeneration)
+            {
+                return Task.CompletedTask;
+            }
+
+            lock (lifecycleStateLock)
+            {
+                resumeAfterGraphicsRecreation =
+                    desiredLifecycleState == ArCoreLifecycleTarget.Running ||
+                    lifecycleState == ArCoreLifecycleState.Running;
+            }
+
+            graphicsContext = null;
+            graphicsTeardownGeneration = unavailableGraphicsGeneration;
+            graphicsTeardownContext = unavailableContext;
+
+            ARRenderGenerationBridge.Suspend(
+                Interlocked.Read(ref currentSessionGeneration),
+                unavailableGraphicsGeneration);
+
+            ARCameraTextureBridge.SuspendProcessing(TimeSpan.Zero);
+            ReleasePendingCameraFrame();
+            InvalidatePublishedFrameState();
+            InvalidateCapabilitySnapshot(
+                "The Vulkan graphics surface is being torn down.");
+
+            Log.Info(
+                Tag,
+                "ARCORE_VULKAN_TEARDOWN_BEGIN " +
+                $"graphicsGeneration={unavailableGraphicsGeneration}, " +
+                $"reason='{reason}'.");
+
+            graphicsTeardownTask =
+                QuiesceGraphicsContextCoreAsync(
+                    unavailableContext,
+                    unavailableGraphicsGeneration,
+                    reason);
+
+            return graphicsTeardownTask;
+        }
+    }
+
+    /// <summary>
+    /// Synchronous terminal path for AndroidSurface.Closing when that event is
+    /// raised on the Evergine graphics-owner thread. It does not depend on a
+    /// future DrawFrame callback, because the closing surface may not provide
+    /// one.
+    /// </summary>
+    public void QuiesceGraphicsContextAtSurfaceBoundary(
+        VKGraphicsContext unavailableContext,
+        long unavailableGraphicsGeneration,
+        string reason)
+    {
+        ArgumentNullException.ThrowIfNull(unavailableContext);
+
+        lock (graphicsTeardownLock)
+        {
+            if (!ReferenceEquals(graphicsContext, unavailableContext) ||
+                Interlocked.Read(ref graphicsGeneration) !=
+                    unavailableGraphicsGeneration)
+            {
+                return;
+            }
+
+            if (graphicsTeardownTask is not null &&
+                !graphicsTeardownTask.IsCompleted)
+            {
+                throw new InvalidOperationException(
+                    "An asynchronous Vulkan teardown is already in progress.");
+            }
+
+            lock (lifecycleStateLock)
+            {
+                resumeAfterGraphicsRecreation =
+                    desiredLifecycleState == ArCoreLifecycleTarget.Running ||
+                    lifecycleState == ArCoreLifecycleState.Running;
+            }
+
+            graphicsContext = null;
+            graphicsTeardownGeneration = unavailableGraphicsGeneration;
+            graphicsTeardownContext = unavailableContext;
+        }
+
+        ARRenderGenerationBridge.Suspend(
+            Interlocked.Read(ref currentSessionGeneration),
+            unavailableGraphicsGeneration);
+
+        ARCameraTextureBridge.SuspendProcessing(TimeSpan.Zero);
+        ReleasePendingCameraFrame();
+        InvalidatePublishedFrameState();
+        InvalidateCapabilitySnapshot(
+            "The Vulkan graphics surface reached its owner-thread boundary.");
+
+        Log.Info(
+            Tag,
+            "ARCORE_VULKAN_TEARDOWN_BEGIN " +
+            $"graphicsGeneration={unavailableGraphicsGeneration}, " +
+            $"reason='{reason}', ownerThreadBoundary=True.");
+
+        try
+        {
+            ArCoreLifecycleResult pauseResult =
+                PauseAsync(CancellationToken.None)
+                    .WaitAsync(TimeSpan.FromSeconds(12))
+                    .GetAwaiter()
+                    .GetResult();
+
+            if (!pauseResult.Success)
+            {
+                throw new InvalidOperationException(
+                    "ARCore could not be paused before owner-thread Vulkan " +
+                    $"teardown: {pauseResult.Failure.Message}");
+            }
+
+            ARCameraTextureBridge
+                .ExecuteDrawThreadTeardownAtSurfaceBoundary(
+                    unavailableGraphicsGeneration,
+                    () => TeardownGraphicsResourcesOnDrawThread(
+                        unavailableContext,
+                        unavailableGraphicsGeneration));
+        }
+        finally
+        {
+            lock (graphicsTeardownLock)
+            {
+                graphicsTeardownTask = null;
+                graphicsTeardownContext = null;
+            }
+        }
+    }
+
+    private async Task QuiesceGraphicsContextCoreAsync(
+        VKGraphicsContext unavailableContext,
+        long unavailableGraphicsGeneration,
+        string reason)
+    {
+        try
+        {
+            ArCoreLifecycleResult pauseResult =
+                await PauseAsync(CancellationToken.None).ConfigureAwait(false);
+
+            if (!pauseResult.Success)
+            {
+                throw new InvalidOperationException(
+                    "ARCore could not be paused before Vulkan teardown: " +
+                    pauseResult.Failure.Message);
+            }
+
+            Task drawThreadTeardown =
+                ARCameraTextureBridge.RequestDrawThreadTeardownAsync(
+                    unavailableGraphicsGeneration,
+                    () => TeardownGraphicsResourcesOnDrawThread(
+                        unavailableContext,
+                        unavailableGraphicsGeneration));
+
+            await drawThreadTeardown.WaitAsync(
+                GraphicsTeardownTimeout).ConfigureAwait(false);
+
+            Log.Debug(
+                Tag,
+                "ARCore Vulkan graphics generation quiesced: " +
+                $"generation={unavailableGraphicsGeneration}, " +
+                $"reason='{reason}'.");
+        }
+        finally
+        {
+            lock (graphicsTeardownLock)
+            {
+                if (graphicsTeardownGeneration ==
+                    unavailableGraphicsGeneration)
+                {
+                    graphicsTeardownTask = null;
+                    graphicsTeardownContext = null;
+                }
+            }
+        }
+    }
+
+    private void TeardownGraphicsResourcesOnDrawThread(
+        VKGraphicsContext unavailableContext,
+        long unavailableGraphicsGeneration)
+    {
+        /*
+         * MyApplication skips base.DrawFrame for this callback, so no new
+         * submit/present can race the device-idle barrier below.
+         */
+        EvergineArCameraFrameImporter.WaitForGraphicsDeviceIdle(
+            unavailableContext);
+
+        Log.Info(
+            Tag,
+            "ARCORE_VULKAN_GPU_IDLE " +
+            $"graphicsGeneration={unavailableGraphicsGeneration}.");
+
+        ARCameraBackgroundBehavior.TeardownGraphicsGeneration(
+            unavailableGraphicsGeneration);
+
+        ARCameraSpatialController.TeardownGraphicsGeneration(
+            unavailableGraphicsGeneration);
+
+        ARCameraTextureBridge.Clear();
+        ARCameraPoseBridge.Clear();
+        ARDepthOcclusionBridge.Clear();
+        ARGroundStateBridge.Clear(
+            "Vulkan graphics generation teardown");
+        long clearedFloodVersion =
+            ARFloodDepthBridge.Clear(
+                "Vulkan graphics generation teardown");
+
+        ARFloodDepthBridge.AcknowledgeDrawThreadVersion(
+            clearedFloodVersion);
+        ARRouteBridge.Clear();
+
+        IArCameraFrameImporter? currentImporter = importer;
+        currentImporter?.Dispose();
+
+        if (ReferenceEquals(importer, currentImporter))
+        {
+            importer = null;
+        }
+
+        lastProcessedTimestamp = long.MinValue;
+
+        Log.Info(
+            Tag,
+            "ARCORE_VULKAN_DRAW_TEARDOWN_ACK " +
+            $"graphicsGeneration={unavailableGraphicsGeneration}, " +
+            $"rejectedStaleCallbacks=" +
+            $"{ARRenderGenerationBridge.RejectedCallbackCount}.");
+    }
+
+    private void StartFrameLoop(
+        long sessionGeneration)
     {
         if (session is null)
         {
@@ -1083,6 +1120,20 @@ public sealed partial class ArCoreService : IArCoreService
             Log.Debug(
                 Tag,
                 "Automatic ARCore frame loop not started because Session is paused.");
+
+            return;
+        }
+
+        if (sessionGeneration <= 0 ||
+            sessionGeneration !=
+                Interlocked.Read(
+                    ref currentSessionGeneration))
+        {
+            Log.Debug(
+                Tag,
+                "Discarded stale frame-loop start request: " +
+                $"requestedGeneration={sessionGeneration}, " +
+                $"currentGeneration={Interlocked.Read(ref currentSessionGeneration)}.");
 
             return;
         }
@@ -1108,6 +1159,7 @@ public sealed partial class ArCoreService : IArCoreService
         frameLoopTask =
             Task.Run(
                 () => RunFrameLoop(
+                    sessionGeneration,
                     cancellationToken),
                 cancellationToken);
 
@@ -1117,6 +1169,7 @@ public sealed partial class ArCoreService : IArCoreService
     }
 
     private void RunFrameLoop(
+        long sessionGeneration,
         CancellationToken cancellationToken)
     {
         Log.Debug(
@@ -1128,13 +1181,16 @@ public sealed partial class ArCoreService : IArCoreService
             RefreshPowerThermalDecisionIfNeeded(
                 force: true);
 
-            while (!cancellationToken.IsCancellationRequested)
+            while (!cancellationToken.IsCancellationRequested &&
+                   sessionGeneration ==
+                       Interlocked.Read(
+                           ref currentSessionGeneration))
             {
                 long iterationStartedTimestamp =
                     Environment.TickCount64;
 
                 UpdateFrameSerialized(
-                    fromAutomaticLoop: true,
+                    sessionGeneration,
                     cancellationToken);
 
                 RefreshPowerThermalDecisionIfNeeded(
@@ -1164,18 +1220,18 @@ public sealed partial class ArCoreService : IArCoreService
     }
 
     private Frame? UpdateFrameSerialized(
-        bool fromAutomaticLoop,
+        long sessionGeneration,
         CancellationToken cancellationToken)
     {
+        if (sessionGeneration !=
+            Interlocked.Read(
+                ref currentSessionGeneration))
+        {
+            return null;
+        }
+
         if (session is null)
         {
-            if (!fromAutomaticLoop)
-            {
-                Log.Warn(
-                    Tag,
-                    "Update() called but ARCore Session is null.");
-            }
-
             return null;
         }
 
@@ -1189,31 +1245,36 @@ public sealed partial class ArCoreService : IArCoreService
 
         try
         {
-            if (fromAutomaticLoop)
-            {
+            bool entered =
                 updateGate.Wait(
+                    FrameUpdateGateTimeoutMilliseconds,
                     cancellationToken);
-            }
-            else
+
+            if (!entered)
             {
-                updateGate.Wait();
+                RecordSerializedFrameDrop(
+                    sessionGeneration);
+
+                return null;
             }
 
             gateEntered =
                 true;
 
             /*
-             * Re-check after entering the gate. A manual Update() may have
-             * started immediately before PauseCameraSessionAsync() changed
-             * sessionPaused and then waited for this gate.
+             * Re-check after entering the gate. A newer pause, shutdown, or
+             * session generation may have superseded this queued frame.
              */
-            if (sessionPaused)
+            if (sessionPaused ||
+                sessionGeneration !=
+                    Interlocked.Read(
+                        ref currentSessionGeneration))
             {
                 return null;
             }
 
             return UpdateFrameInternal(
-                fromAutomaticLoop);
+                sessionGeneration);
         }
         catch (OperationCanceledException)
         {
@@ -1228,8 +1289,37 @@ public sealed partial class ArCoreService : IArCoreService
         }
     }
 
+    private void RecordSerializedFrameDrop(
+        long sessionGeneration)
+    {
+        droppedSerializedFrameCount++;
+
+        long now =
+            Environment.TickCount64;
+
+        if (lastFrameDropLogTimestamp !=
+                long.MinValue &&
+            now -
+                lastFrameDropLogTimestamp <
+                    FrameDropLogIntervalMilliseconds)
+        {
+            return;
+        }
+
+        lastFrameDropLogTimestamp =
+            now;
+
+        Log.Warn(
+            Tag,
+            "Dropped stale/bounded ARCore frame work while waiting for the " +
+            "serialized session gate: " +
+            $"sessionGeneration={sessionGeneration}, " +
+            $"droppedFrames={droppedSerializedFrameCount}, " +
+            $"waitLimitMs={FrameUpdateGateTimeoutMilliseconds}.");
+    }
+
     private Frame? UpdateFrameInternal(
-        bool fromAutomaticLoop)
+        long sessionGeneration)
     {
         Session? currentSession =
             session;
@@ -1244,11 +1334,14 @@ public sealed partial class ArCoreService : IArCoreService
             ApplyDisplayGeometryIfNeeded(
                 currentSession);
 
-            if (!fromAutomaticLoop)
+            ARRenderGenerationToken renderGeneration =
+                CaptureRenderGeneration(sessionGeneration);
+
+            if (!ARRenderGenerationBridge.TryAcceptCallback(
+                    renderGeneration,
+                    "session-frame-update"))
             {
-                Log.Debug(
-                    Tag,
-                    "Calling ARCore Session.Update()...");
+                return null;
             }
 
             Frame? frame =
@@ -1263,6 +1356,11 @@ public sealed partial class ArCoreService : IArCoreService
                 return null;
             }
 
+            ArCoreJniOwnershipDiagnostics.Record(
+                "Frame",
+                "Session.Update",
+                "BORROWED_WRAPPER");
+
             long timestamp =
                 frame.Timestamp;
 
@@ -1274,6 +1372,21 @@ public sealed partial class ArCoreService : IArCoreService
 
             lastProcessedTimestamp =
                 timestamp;
+
+            ARFrameMetadata frameMetadata =
+                CaptureFrameMetadata(
+                    renderGeneration,
+                    timestamp);
+
+            if (!frameMetadata.IsValid)
+            {
+                RecordFrameCoherenceDrop(
+                    "invalid display-geometry metadata",
+                    renderGeneration,
+                    timestamp);
+
+                return frame;
+            }
 
             RecordProcessedFrame();
 
@@ -1291,8 +1404,8 @@ public sealed partial class ArCoreService : IArCoreService
             PublishSpatialPose(
                 frame,
                 camera,
-                timestamp,
-                frameZoomRatio);
+                frameZoomRatio,
+                frameMetadata);
 
             LogTextureIntrinsicsOnce(
                 camera);
@@ -1303,8 +1416,8 @@ public sealed partial class ArCoreService : IArCoreService
             TryPublishDepthOcclusionFrame(
                 frame,
                 camera,
-                timestamp,
-                frameZoomRatio);
+                frameZoomRatio,
+                frameMetadata);
 
             if (captureCpuDiagnosticRequested)
             {
@@ -1319,25 +1432,6 @@ public sealed partial class ArCoreService : IArCoreService
                 }
             }
 
-            if (!fromAutomaticLoop)
-            {
-                Log.Debug(
-                    Tag,
-                    $"Frame Timestamp: {timestamp}");
-
-                Log.Debug(
-                    Tag,
-                    $"Camera Tracking State: {camera.TrackingState}");
-
-                Log.Debug(
-                    Tag,
-                    $"Tracking Failure Reason: {camera.TrackingFailureReason}");
-
-                Log.Debug(
-                    Tag,
-                    $"Camera Texture Name: {frame.CameraTextureName}");
-            }
-
             HardwareBuffer? hardwareBuffer =
                 frame.HardwareBuffer;
 
@@ -1350,18 +1444,16 @@ public sealed partial class ArCoreService : IArCoreService
                 return frame;
             }
 
+            ArCoreJniOwnershipDiagnostics.Record(
+                "HardwareBuffer",
+                "Frame.HardwareBuffer",
+                "OWNED_UNTIL_CLOSE");
+
             bool ownershipTransferred =
                 false;
 
             try
             {
-                if (!fromAutomaticLoop)
-                {
-                    Log.Debug(
-                        Tag,
-                        $"Hardware Buffer: {hardwareBuffer}");
-                }
-
                 if (!hasInspectedHardwareBuffer)
                 {
                     hasInspectedHardwareBuffer =
@@ -1373,14 +1465,6 @@ public sealed partial class ArCoreService : IArCoreService
 
                 if (graphicsContext is null)
                 {
-                    if (!fromAutomaticLoop)
-                    {
-                        Log.Warn(
-                            Tag,
-                            "HardwareBuffer is available, but " +
-                            "VKGraphicsContext is unavailable.");
-                    }
-
                     return frame;
                 }
 
@@ -1394,11 +1478,11 @@ public sealed partial class ArCoreService : IArCoreService
                     out uint outputHeight);
 
                 QueuePendingCameraFrame(
+                    frameMetadata,
                     hardwareBuffer,
                     cameraUv,
                     outputWidth,
-                    outputHeight,
-                    timestamp);
+                    outputHeight);
 
                 ownershipTransferred =
                     true;
@@ -1425,19 +1509,28 @@ public sealed partial class ArCoreService : IArCoreService
     }
 
     private void QueuePendingCameraFrame(
+        ARFrameMetadata metadata,
         HardwareBuffer hardwareBuffer,
         float[] cameraUv,
         uint outputWidth,
-        uint outputHeight,
-        long timestamp)
+        uint outputHeight)
     {
+        if (!CanAttemptCameraImport(
+                metadata.Generation.GraphicsGeneration))
+        {
+            CloseHardwareBuffer(
+                hardwareBuffer);
+
+            return;
+        }
+
         PendingCameraFrame replacement =
             new(
+                metadata,
                 hardwareBuffer,
                 cameraUv,
                 outputWidth,
-                outputHeight,
-                timestamp);
+                outputHeight);
 
         PendingCameraFrame? replacedFrame;
 
@@ -1475,6 +1568,21 @@ public sealed partial class ArCoreService : IArCoreService
             return;
         }
 
+        if (!ARRenderGenerationBridge.TryAcceptCallback(
+                pendingFrame.Metadata.Generation,
+                "pending-camera-import"))
+        {
+            pendingFrame.Dispose();
+            return;
+        }
+
+        if (!CanAttemptCameraImport(
+                pendingFrame.Metadata.Generation.GraphicsGeneration))
+        {
+            pendingFrame.Dispose();
+            return;
+        }
+
         try
         {
             VKGraphicsContext? currentGraphicsContext =
@@ -1492,28 +1600,23 @@ public sealed partial class ArCoreService : IArCoreService
             try
             {
                 var texture =
-                    importer.ImportHardwareBuffer(
+                    importer.Import(
                         pendingFrame.HardwareBuffer,
                         pendingFrame.CameraUv,
                         pendingFrame.OutputWidth,
                         pendingFrame.OutputHeight);
 
+                RecordCameraImportSuccess();
+
                 ARCameraTextureBridge.Publish(
+                    pendingFrame.Metadata,
                     texture);
-            }
-            catch (NotSupportedException exception)
-            {
-                Log.Error(
-                    Tag,
-                    $"Unsupported HardwareBuffer format: " +
-                    $"{exception.Message}");
             }
             catch (Exception exception)
             {
-                Log.Error(
-                    Tag,
-                    $"HardwareBuffer import failed on Evergine " +
-                    $"draw thread: {exception}");
+                HandleCameraImportFailure(
+                    exception,
+                    pendingFrame.Metadata.Generation.GraphicsGeneration);
             }
         }
         finally
@@ -1541,6 +1644,11 @@ public sealed partial class ArCoreService : IArCoreService
     private static void CloseHardwareBuffer(
         HardwareBuffer hardwareBuffer)
     {
+        ArCoreJniOwnershipDiagnostics.Record(
+            "HardwareBuffer",
+            "CloseHardwareBuffer",
+            "CLOSE_AND_DISPOSE");
+
         try
         {
             hardwareBuffer.Close();
@@ -1562,12 +1670,15 @@ public sealed partial class ArCoreService : IArCoreService
         private HardwareBuffer? hardwareBuffer;
 
         public PendingCameraFrame(
+            ARFrameMetadata metadata,
             HardwareBuffer hardwareBuffer,
             float[] cameraUv,
             uint outputWidth,
-            uint outputHeight,
-            long timestamp)
+            uint outputHeight)
         {
+            Metadata =
+                metadata;
+
             this.hardwareBuffer =
                 hardwareBuffer
                 ?? throw new ArgumentNullException(
@@ -1583,9 +1694,6 @@ public sealed partial class ArCoreService : IArCoreService
 
             OutputHeight =
                 outputHeight;
-
-            Timestamp =
-                timestamp;
         }
 
         public HardwareBuffer HardwareBuffer =>
@@ -1593,13 +1701,13 @@ public sealed partial class ArCoreService : IArCoreService
             ?? throw new ObjectDisposedException(
                 nameof(PendingCameraFrame));
 
+        public ARFrameMetadata Metadata { get; }
+
         public float[] CameraUv { get; }
 
         public uint OutputWidth { get; }
 
         public uint OutputHeight { get; }
-
-        public long Timestamp { get; }
 
         public void Dispose()
         {
@@ -1624,19 +1732,31 @@ public sealed partial class ArCoreService : IArCoreService
     private void PublishSpatialPose(
         Frame frame,
         ArCoreCamera camera,
-        long timestamp,
-        float zoomRatio)
+        float zoomRatio,
+        ARFrameMetadata frameMetadata)
     {
+        long timestamp =
+            frameMetadata.FrameTimestamp;
+
         string trackingState =
             camera.TrackingState.ToString();
 
         string trackingFailureReason =
             camera.TrackingFailureReason.ToString();
 
+        ARTrackingStateBridge.TrackingSnapshot trackingSnapshot =
+            ARTrackingStateBridge.PublishObservation(
+                frameMetadata.Generation.SessionGeneration,
+                trackingState,
+                trackingFailureReason,
+                timestamp,
+                depthModeEnabled);
+
         LogTrackingTransitionIfNeeded(
             trackingState,
             trackingFailureReason,
-            timestamp);
+            timestamp,
+            trackingSnapshot);
 
         if (!trackingState.Equals(
                 "Tracking",
@@ -1649,9 +1769,16 @@ public sealed partial class ArCoreService : IArCoreService
              */
             InvalidatePendingRecoveryCountdown();
 
+            ARFloodDepthBridge.Clear(
+                "ARCore camera tracking unavailable");
+
+            ARGroundStateBridge.Suspend(
+                frameMetadata.Generation,
+                "ARCore camera tracking unavailable");
+
             ARCameraPoseBridge.PublishTrackingUnavailable(
                 trackingFailureReason,
-                timestamp);
+                frameMetadata);
 
             LogSpatialPoseTelemetryIfNeeded(
                 trackingState,
@@ -1672,9 +1799,16 @@ public sealed partial class ArCoreService : IArCoreService
 
             InvalidatePendingRecoveryCountdown();
 
+            ARFloodDepthBridge.Clear(
+                "ARCore display-oriented pose unavailable");
+
+            ARGroundStateBridge.Suspend(
+                frameMetadata.Generation,
+                "ARCore display-oriented pose unavailable");
+
             ARCameraPoseBridge.PublishTrackingUnavailable(
                 trackingFailureReason,
-                timestamp);
+                frameMetadata);
 
             LogSpatialPoseTelemetryIfNeeded(
                 trackingState,
@@ -1682,6 +1816,11 @@ public sealed partial class ArCoreService : IArCoreService
 
             return;
         }
+
+        ArCoreJniOwnershipDiagnostics.Record(
+            "Pose",
+            "Camera.DisplayOrientedPose",
+            "USING_DISPOSE");
 
         float[] translation =
             new float[3];
@@ -1740,6 +1879,23 @@ public sealed partial class ArCoreService : IArCoreService
 
         if (shouldSearchForGroundAnchor)
         {
+            ARGroundStateBridge.GroundStateSnapshot groundState =
+                ARGroundStateBridge.Current;
+
+            if (groundState.Trust == ARGroundTrust.None &&
+                (groundState.RenderGeneration.SessionGeneration !=
+                    frameMetadata.Generation.SessionGeneration ||
+                 (groundState.State != ARGroundLifecycleState.Searching &&
+                  groundState.State != ARGroundLifecycleState.Recovering)))
+            {
+                ARGroundStateBridge.BeginSearch(
+                    frameMetadata.Generation,
+                    spatialGroundAnchor is not null,
+                    spatialGroundAnchor is null
+                        ? "initial floor acquisition"
+                        : "validated replacement floor acquisition");
+            }
+
             TryCreateSpatialGroundAnchor(
                 frame,
                 translation,
@@ -1752,10 +1908,71 @@ public sealed partial class ArCoreService : IArCoreService
                 out float anchorY,
                 out float anchorZ);
 
+        if (anchorAvailable)
+        {
+            if (IsGroundAnchorProvisional)
+            {
+                ARGroundStateBridge.PublishProvisional(
+                    frameMetadata.Generation,
+                    "camera-relative provisional ground");
+            }
+            else if (ARGroundStateBridge.Current.Trust !=
+                     ARGroundTrust.Verified)
+            {
+                ARGroundStateBridge.PublishVerified(
+                    frameMetadata.Generation,
+                    "tracked ARCore ground anchor resumed");
+            }
+
+            if (hasProvisionalGroundReference)
+            {
+                RegisterProvisionalGroundVerification();
+            }
+
+            ClearProvisionalGroundReference(
+                "verified ARCore ground anchor is tracking");
+        }
+        else if (spatialGroundAnchor is null)
+        {
+            anchorAvailable =
+                TryGetProvisionalGroundReference(
+                    translation,
+                    out anchorX,
+                    out anchorY,
+                    out anchorZ);
+        }
+
+        if (anchorAvailable &&
+            ARGroundStateBridge.Current.RenderGeneration !=
+                frameMetadata.Generation)
+        {
+            ARGroundStateBridge.RefreshRenderGeneration(
+                frameMetadata.Generation,
+                "ground reference carried into current display geometry");
+        }
+
+        if (!anchorAvailable)
+        {
+            ARFloodDepthBridge.Clear(
+                "ARCore ground reference unavailable");
+        }
+
         /*
          * Publish camera, projection, anchor, tracking, and timestamp as one
          * coherent snapshot.
          */
+        ARGroundStateBridge.GroundStateSnapshot frameGroundState =
+            ARGroundStateBridge.Current;
+
+        if (!anchorAvailable)
+        {
+            frameGroundState =
+                frameGroundState with
+                {
+                    Trust = ARGroundTrust.None
+                };
+        }
+
         ARCameraPoseBridge.PublishFrame(
             true,
             trackingFailureReason,
@@ -1769,11 +1986,11 @@ public sealed partial class ArCoreService : IArCoreService
             projection,
             SpatialProjectionNearPlane,
             SpatialProjectionFarPlane,
-            anchorAvailable,
+            frameGroundState,
             anchorX,
             anchorY,
             anchorZ,
-            timestamp);
+            frameMetadata);
 
         /*
          * Start/clear retained-anchor recovery from the ARCore frame cadence
@@ -1808,8 +2025,7 @@ public sealed partial class ArCoreService : IArCoreService
         }
 
         nextGroundPlaneSearchTimestamp =
-            now +
-            GroundPlaneSearchIntervalMilliseconds;
+            now + GetGroundProbeIntervalMilliseconds();
 
         if (groundPlaneSearchStartedTimestamp ==
             long.MinValue)
@@ -1838,9 +2054,30 @@ public sealed partial class ArCoreService : IArCoreService
             return;
         }
 
+        if (!TryBeginGroundProbeSweep(now))
+        {
+            return;
+        }
+
         groundPlaneSearchSweepCount++;
 
+        bool reducedProbeSweep =
+            depthModeEnabled &&
+            groundDepthUnavailableSweepCount >=
+                GroundDepthUnavailableSweepsBeforeReducedProbing &&
+            groundPlaneSearchSweepCount %
+                GroundReducedProbeFullSweepCadence !=
+                    0;
+
         ResetGroundPlaneSweepCandidate();
+
+        bool usableEvidenceObserved = false;
+
+        groundDepthConfidenceRecordedThisSweep = false;
+        groundDepthSweepSupportCount = 0;
+        groundDepthSweepCandidateX = 0.0f;
+        groundDepthSweepCandidateY = 0.0f;
+        groundDepthSweepCandidateZ = 0.0f;
 
         if (!hasLoggedGroundPlaneSearch)
         {
@@ -1849,7 +2086,7 @@ public sealed partial class ArCoreService : IArCoreService
 
             Log.Debug(
                 SpatialPoseTag,
-                "Searching for ARCore ground with V4 acquisition: " +
+                "Searching for ARCore ground with V6 safe-margin adaptive acquisition: " +
                 $"depthEnabled={depthModeEnabled}, " +
                 $"{GroundPlaneWorldDownSearchPattern.Length} world-down Plane ray + " +
                 $"{GroundPlaneSearchPattern.Length} lower-view screen rays, " +
@@ -1858,6 +2095,9 @@ public sealed partial class ArCoreService : IArCoreService
                 $"planeSpatialSupport={GroundPlaneRequiredSpatialSamples}, " +
                 $"depthConfidence={GroundDepthValidSweepsRequired}/" +
                 $"{GroundDepthConfidenceWindowSweeps}. " +
+                $"reducedProbeAfter=" +
+                $"{GroundDepthUnavailableSweepsBeforeReducedProbing} misses, " +
+                $"fullSweepCadence={GroundReducedProbeFullSweepCadence}. " +
                 "Preference=spatially supported upward Plane; " +
                 "fallback=rolling-confidence upward DepthPoint.");
         }
@@ -1870,11 +2110,24 @@ public sealed partial class ArCoreService : IArCoreService
         float[] worldRayOrigin =
             new float[3];
 
+        int worldProbeLimit = Math.Min(
+            3,
+            Math.Max(
+                1,
+                powerThermalDecision.MaximumGroundProbesPerSweep -
+                    GroundDepthRequiredSpatialSamples));
+
         for (int sampleIndex = 0;
+             !reducedProbeSweep &&
              sampleIndex <
-                GroundPlaneWorldDownSearchPattern.Length;
+                worldProbeLimit;
              sampleIndex++)
         {
+            if (!TryConsumeGroundProbeBudget(now))
+            {
+                break;
+            }
+
             (float xOffset,
              float zOffset) =
                 GroundPlaneWorldDownSearchPattern[
@@ -1921,13 +2174,27 @@ public sealed partial class ArCoreService : IArCoreService
          */
         for (int sampleIndex = 0;
              sampleIndex <
-                GroundPlaneSearchPattern.Length;
+                (reducedProbeSweep
+                    ? 1
+                    : GroundPlaneSearchPattern.Length);
              sampleIndex++)
         {
+            if (!TryConsumeGroundProbeBudget(now))
+            {
+                break;
+            }
+
             (float normalizedX,
              float normalizedY) =
                 GroundPlaneSearchPattern[
                     sampleIndex];
+
+            if (normalizedX is < 0.08f or > 0.92f ||
+                normalizedY is < 0.08f or > 0.92f)
+            {
+                RecordGroundProbeRejection(GroundProbeRejection.Edge);
+                continue;
+            }
 
             float arCoreNormalizedX =
                 MapZoomedViewCoordinateToArCoreView(
@@ -1972,19 +2239,45 @@ public sealed partial class ArCoreService : IArCoreService
             }
 
             if (depthModeEnabled &&
-                sampleIndex ==
-                    GroundDepthCandidateSampleIndex &&
-                TryCreateDepthGroundAnchorFromHits(
-                    hitResults,
-                    now,
-                    cameraTranslation[1],
-                    sampleIndex,
-                    GroundPlaneSearchPattern.Length,
-                    sampleDescription))
+                sampleIndex < GroundDepthCandidateSampleCount)
             {
-                return;
+                bool depthAnchorCreated =
+                    TryCreateDepthGroundAnchorFromHits(
+                        hitResults,
+                        now,
+                        cameraTranslation[1],
+                        sampleIndex,
+                        GroundPlaneSearchPattern.Length,
+                        sampleDescription,
+                        out bool acceptableDepthCandidateObserved);
+
+                usableEvidenceObserved |=
+                    acceptableDepthCandidateObserved;
+
+                if (depthAnchorCreated)
+                {
+                    return;
+                }
             }
         }
+
+        if (depthModeEnabled &&
+            !groundDepthConfidenceRecordedThisSweep)
+        {
+            RecordGroundDepthConfidenceSample(valid: false);
+            groundDepthUnavailableSweepCount++;
+        }
+        else if (groundDepthConfidenceRecordedThisSweep)
+        {
+            groundDepthUnavailableSweepCount = 0;
+        }
+
+        usableEvidenceObserved |=
+            groundPlaneSweepCandidateSupportCount > 0;
+
+        CompleteGroundProbeSweep(
+            now,
+            usableEvidenceObserved);
 
         if (lastGroundPlaneSearchProgressLogTimestamp ==
                 long.MinValue ||
@@ -2008,11 +2301,13 @@ public sealed partial class ArCoreService : IArCoreService
                 $"depthConfidence={groundDepthConfidenceValidSweepCount}/" +
                 $"{GroundDepthConfidenceWindowSweeps}, " +
                 $"depthSamples={groundDepthConfidenceWindowCount}, " +
+                $"depthUnavailableSweeps={groundDepthUnavailableSweepCount}, " +
+                $"reducedProbe={reducedProbeSweep}, " +
                 $"sweeps={groundPlaneSearchSweepCount}, " +
                 $"hitTests={groundPlaneSearchHitTestCount}, " +
                 $"elapsed={elapsedMilliseconds}ms. " +
                 (depthModeEnabled
-                    ? "Aim the lower-center camera region at the floor and move slowly."
+                    ? "Keep the floor visible along the bottom of the camera view and move slowly."
                     : "Depth unavailable; keep textured floor visible while ARCore expands its Plane polygon."));
         }
     }
@@ -2026,18 +2321,41 @@ public sealed partial class ArCoreService : IArCoreService
         int sampleCount,
         string sampleDescription)
     {
+        bool planeObserved = false;
+
         foreach (Google.AR.Core.HitResult hit in hitResults)
         {
+            ArCoreJniOwnershipDiagnostics.Record(
+                "HitResult",
+                "TryCreatePlaneGroundAnchorFromHits",
+                "ENUMERATED_BORROWED_WRAPPER");
+
             if (hit.Trackable is not ArCorePlane plane)
             {
                 continue;
             }
 
+            planeObserved = true;
+
+            ArCoreJniOwnershipDiagnostics.Record(
+                "Plane",
+                "HitResult.Trackable",
+                "BORROWED_WRAPPER");
+
             using Google.AR.Core.Pose? hitPose =
                 hit.HitPose;
 
-            if (hitPose is null ||
-                !plane.IsPoseInPolygon(
+            if (hitPose is null)
+            {
+                continue;
+            }
+
+            ArCoreJniOwnershipDiagnostics.Record(
+                "Pose",
+                "HitResult.HitPose.Plane",
+                "USING_DISPOSE");
+
+            if (!plane.IsPoseInPolygon(
                     hitPose))
             {
                 continue;
@@ -2051,6 +2369,11 @@ public sealed partial class ArCoreService : IArCoreService
                 continue;
             }
 
+            ArCoreJniOwnershipDiagnostics.Record(
+                "Pose",
+                "Plane.CenterPose",
+                "USING_DISPOSE");
+
             float[]? planeNormal =
                 planeCenterPose.GetTransformedAxis(
                     1,
@@ -2060,6 +2383,7 @@ public sealed partial class ArCoreService : IArCoreService
                 planeNormal.Length < 3 ||
                 planeNormal[1] < 0.75f)
             {
+                RecordGroundProbeRejection(GroundProbeRejection.Normal);
                 continue;
             }
 
@@ -2076,6 +2400,7 @@ public sealed partial class ArCoreService : IArCoreService
                         hitTranslation[1],
                         out float cameraHeightAboveGroundMeters))
             {
+                RecordGroundProbeRejection(GroundProbeRejection.Height);
                 continue;
             }
 
@@ -2121,6 +2446,11 @@ public sealed partial class ArCoreService : IArCoreService
             ResetGroundPlaneSearchState();
 
             return true;
+        }
+
+        if (!planeObserved)
+        {
+            RecordGroundProbeRejection(GroundProbeRejection.NoTrackable);
         }
 
         return false;
@@ -2208,105 +2538,121 @@ public sealed partial class ArCoreService : IArCoreService
         float cameraY,
         int sampleIndex,
         int sampleCount,
-        string sampleDescription)
+        string sampleDescription,
+        out bool acceptableDepthCandidateObserved)
     {
+        acceptableDepthCandidateObserved = false;
+        bool depthPointObserved = false;
+
         foreach (Google.AR.Core.HitResult hit in hitResults)
         {
+            ArCoreJniOwnershipDiagnostics.Record(
+                "HitResult",
+                "TryCreateDepthGroundAnchorFromHits",
+                "ENUMERATED_BORROWED_WRAPPER");
+
             if (hit.Trackable is not Google.AR.Core.DepthPoint)
             {
                 continue;
             }
 
-            using Google.AR.Core.Pose? hitPose =
-                hit.HitPose;
+            depthPointObserved = true;
+
+            ArCoreJniOwnershipDiagnostics.Record(
+                "DepthPoint",
+                "HitResult.Trackable",
+                "BORROWED_WRAPPER");
+
+            using Google.AR.Core.Pose? hitPose = hit.HitPose;
 
             if (hitPose is null)
             {
+                RecordGroundProbeRejection(GroundProbeRejection.NoTrackable);
                 continue;
             }
 
-            float[]? surfaceNormal =
-                hitPose.GetTransformedAxis(
-                    1,
-                    1.0f);
+            ArCoreJniOwnershipDiagnostics.Record(
+                "Pose",
+                "HitResult.HitPose.DepthPoint",
+                "USING_DISPOSE");
+
+            float[]? surfaceNormal = hitPose.GetTransformedAxis(1, 1.0f);
 
             if (surfaceNormal is null ||
                 surfaceNormal.Length < 3 ||
-                surfaceNormal[1] <
-                    GroundDepthMinimumNormalY)
+                surfaceNormal[1] < GroundDepthMinimumNormalY)
             {
+                RecordGroundProbeRejection(GroundProbeRejection.Normal);
                 continue;
             }
 
-            float[] hitTranslation =
-                new float[3];
+            float[] hitTranslation = new float[3];
+            hitPose.GetTranslation(hitTranslation, 0);
 
-            hitPose.GetTranslation(
-                hitTranslation,
-                0);
-
-            if (!LocalArNavigationPolicy
-                    .IsPreferredGroundCandidateHeight(
-                        cameraY,
-                        hitTranslation[1],
-                        out float cameraHeight))
+            if (!LocalArNavigationPolicy.IsPreferredGroundCandidateHeight(
+                    cameraY,
+                    hitTranslation[1],
+                    out float cameraHeight))
             {
+                RecordGroundProbeRejection(GroundProbeRejection.Height);
                 continue;
-            }
-
-            bool stableWithPrevious =
-                false;
-
-            if (hasGroundDepthCandidate)
-            {
-                float deltaY =
-                    MathF.Abs(
-                        hitTranslation[1] -
-                        groundDepthCandidateY);
-
-                float deltaX =
-                    hitTranslation[0] -
-                    groundDepthCandidateX;
-
-                float deltaZ =
-                    hitTranslation[2] -
-                    groundDepthCandidateZ;
-
-                float horizontalDelta =
-                    MathF.Sqrt(
-                        deltaX * deltaX +
-                        deltaZ * deltaZ);
-
-                stableWithPrevious =
-                    deltaY <=
-                        GroundDepthMaximumYDeltaMeters &&
-                    horizontalDelta <=
-                        GroundDepthMaximumHorizontalDeltaMeters;
             }
 
             if (hasGroundDepthCandidate &&
-                !stableWithPrevious)
+                !IsGroundDepthCandidateConsistent(
+                    hitTranslation,
+                    groundDepthCandidateX,
+                    groundDepthCandidateY,
+                    groundDepthCandidateZ))
             {
+                RecordGroundProbeRejection(GroundProbeRejection.Consistency);
                 continue;
             }
 
-            if (!hasGroundDepthCandidate)
+            if (groundDepthSweepSupportCount > 0 &&
+                !IsGroundDepthCandidateConsistent(
+                    hitTranslation,
+                    groundDepthSweepCandidateX,
+                    groundDepthSweepCandidateY,
+                    groundDepthSweepCandidateZ))
             {
-                hasGroundDepthCandidate =
-                    true;
+                RecordGroundProbeRejection(GroundProbeRejection.Consistency);
+                continue;
             }
 
-            groundDepthCandidateX =
-                hitTranslation[0];
+            if (groundDepthSweepSupportCount == 0)
+            {
+                groundDepthSweepCandidateX = hitTranslation[0];
+                groundDepthSweepCandidateY = hitTranslation[1];
+                groundDepthSweepCandidateZ = hitTranslation[2];
+            }
+            else
+            {
+                int nextSupport = groundDepthSweepSupportCount + 1;
+                groundDepthSweepCandidateX +=
+                    (hitTranslation[0] - groundDepthSweepCandidateX) / nextSupport;
+                groundDepthSweepCandidateY +=
+                    (hitTranslation[1] - groundDepthSweepCandidateY) / nextSupport;
+                groundDepthSweepCandidateZ +=
+                    (hitTranslation[2] - groundDepthSweepCandidateZ) / nextSupport;
+            }
 
-            groundDepthCandidateY =
-                hitTranslation[1];
+            groundDepthSweepSupportCount++;
 
-            groundDepthCandidateZ =
-                hitTranslation[2];
+            if (groundDepthSweepSupportCount <
+                    GroundDepthRequiredSpatialSamples ||
+                groundDepthConfidenceRecordedThisSweep)
+            {
+                return false;
+            }
 
-            RecordGroundDepthConfidenceSample(
-                valid: true);
+            hasGroundDepthCandidate = true;
+            groundDepthCandidateX = groundDepthSweepCandidateX;
+            groundDepthCandidateY = groundDepthSweepCandidateY;
+            groundDepthCandidateZ = groundDepthSweepCandidateZ;
+            groundDepthConfidenceRecordedThisSweep = true;
+            acceptableDepthCandidateObserved = true;
+            RecordGroundDepthConfidenceSample(valid: true);
 
             if (groundDepthConfidenceValidSweepCount <
                 GroundDepthValidSweepsRequired)
@@ -2314,55 +2660,56 @@ public sealed partial class ArCoreService : IArCoreService
                 return false;
             }
 
-            if (!TryAssignGroundAnchorFromHit(
-                    hit,
-                    "DepthPoint"))
+            if (!TryAssignGroundAnchorFromHit(hit, "DepthPoint"))
             {
                 ResetGroundDepthCandidate();
                 return false;
             }
 
-            long elapsedMilliseconds =
-                Math.Max(
-                    0,
-                    acquisitionTimestamp -
-                    groundPlaneSearchStartedTimestamp);
+            long elapsedMilliseconds = Math.Max(
+                0,
+                acquisitionTimestamp - groundPlaneSearchStartedTimestamp);
 
             Log.Debug(
                 SpatialPoseTag,
-                "ARCore GROUND anchor created from rolling-confidence DepthPoint fallback.");
-
-            Log.Debug(
-                SpatialPoseTag,
-                "Ground acquisition = " +
-                "method=DEPTH_ROLLING, " +
-                $"depthEnabled={depthModeEnabled}, " +
-                $"sample={sampleIndex + 1}/{sampleCount}, " +
-                $"{sampleDescription}, " +
+                "Ground acquisition = method=DEPTH_MULTI_SAMPLE_ROLLING, " +
+                $"sample={sampleIndex + 1}/{sampleCount}, {sampleDescription}, " +
+                $"sameFrameSupport={groundDepthSweepSupportCount}/" +
+                $"{GroundDepthRequiredSpatialSamples}, " +
                 $"depthConfidence={groundDepthConfidenceValidSweepCount}/" +
                 $"{GroundDepthConfidenceWindowSweeps}, " +
-                $"depthSamples={groundDepthConfidenceWindowCount}, " +
                 $"sweeps={groundPlaneSearchSweepCount}, " +
                 $"hitTests={groundPlaneSearchHitTestCount}, " +
                 $"elapsed={elapsedMilliseconds}ms, " +
-                $"hit=({hitTranslation[0]:F2},{hitTranslation[1]:F2},{hitTranslation[2]:F2}), " +
                 $"normalY={surfaceNormal[1]:F2}, " +
                 $"cameraToGroundVertical={cameraHeight:F2}m.");
 
             ResetGroundPlaneSearchState();
-
             return true;
         }
 
-        /*
-         * The designated lower-center sample yielded no acceptable DepthPoint
-         * this sweep. Record one miss without discarding earlier consistent
-         * evidence; old evidence naturally expires from the rolling window.
-         */
-        RecordGroundDepthConfidenceSample(
-            valid: false);
+        if (!depthPointObserved)
+        {
+            RecordGroundProbeRejection(GroundProbeRejection.NoTrackable);
+        }
 
         return false;
+    }
+
+    private static bool IsGroundDepthCandidateConsistent(
+        float[] candidate,
+        float referenceX,
+        float referenceY,
+        float referenceZ)
+    {
+        float deltaY = MathF.Abs(candidate[1] - referenceY);
+        float deltaX = candidate[0] - referenceX;
+        float deltaZ = candidate[2] - referenceZ;
+        float horizontalDelta = MathF.Sqrt(
+            deltaX * deltaX + deltaZ * deltaZ);
+
+        return deltaY <= GroundDepthMaximumYDeltaMeters &&
+            horizontalDelta <= GroundDepthMaximumHorizontalDeltaMeters;
     }
 
     private void RecordGroundDepthConfidenceSample(
@@ -2444,6 +2791,13 @@ public sealed partial class ArCoreService : IArCoreService
                 ref spatialGroundAnchor,
                 newAnchor);
 
+        ARGroundStateBridge.PublishVerified(
+            ARRenderGenerationBridge.Current,
+            $"ARCore {source} ground anchor acquired");
+
+        RegisterGroundProbeSuccess(
+            Environment.TickCount64);
+
         if (previousAnchor is not null &&
             !ReferenceEquals(
                 previousAnchor,
@@ -2487,6 +2841,12 @@ public sealed partial class ArCoreService : IArCoreService
 
         groundDepthConfidenceValidSweepCount =
             0;
+
+        groundDepthConfidenceRecordedThisSweep = false;
+        groundDepthSweepSupportCount = 0;
+        groundDepthSweepCandidateX = 0.0f;
+        groundDepthSweepCandidateY = 0.0f;
+        groundDepthSweepCandidateZ = 0.0f;
     }
 
     private void ResetGroundPlaneSweepCandidate()
@@ -2522,6 +2882,9 @@ public sealed partial class ArCoreService : IArCoreService
             0;
 
         groundPlaneSearchHitTestCount =
+            0;
+
+        groundDepthUnavailableSweepCount =
             0;
 
         ResetGroundPlaneSweepCandidate();
@@ -2584,10 +2947,162 @@ public sealed partial class ArCoreService : IArCoreService
         return true;
     }
 
+    private bool TryGetProvisionalGroundReference(
+        float[] cameraTranslation,
+        out float anchorX,
+        out float anchorY,
+        out float anchorZ)
+    {
+        anchorX = 0.0f;
+        anchorY = 0.0f;
+        anchorZ = 0.0f;
+
+        if (cameraTranslation is null ||
+            cameraTranslation.Length <
+                3 ||
+            groundPlaneSearchStartedTimestamp ==
+                long.MinValue)
+        {
+            return false;
+        }
+
+        long elapsedMilliseconds =
+            Math.Max(
+                0,
+                Environment.TickCount64 -
+                    groundPlaneSearchStartedTimestamp);
+
+        if (!hasProvisionalGroundReference)
+        {
+            if (elapsedMilliseconds <
+                ProvisionalGroundDelayMilliseconds)
+            {
+                return false;
+            }
+
+            provisionalGroundX =
+                cameraTranslation[0];
+
+            provisionalGroundY =
+                cameraTranslation[1] -
+                    ProvisionalCameraHeightMeters;
+
+            provisionalGroundZ =
+                cameraTranslation[2];
+
+            hasProvisionalGroundReference =
+                true;
+
+            Volatile.Write(
+                ref isGroundAnchorProvisional,
+                1);
+
+            ARGroundStateBridge.PublishProvisional(
+                ARRenderGenerationBridge.Current,
+                "camera-relative provisional ground");
+
+            Log.Warn(
+                SpatialPoseTag,
+                "PROVISIONAL ground reference published for emergency-start " +
+                "guidance: " +
+                $"delay={elapsedMilliseconds}ms, " +
+                $"estimatedCameraHeight={ProvisionalCameraHeightMeters:F2}m, " +
+                $"reference=({provisionalGroundX:F2}," +
+                $"{provisionalGroundY:F2},{provisionalGroundZ:F2}). " +
+                "Plane/Depth verification remains active; do not treat this " +
+                "estimate as a verified physical floor.");
+        }
+
+        anchorX =
+            provisionalGroundX;
+
+        anchorY =
+            provisionalGroundY;
+
+        anchorZ =
+            provisionalGroundZ;
+
+        return true;
+    }
+
+    private void ClearProvisionalGroundReference(
+        string reason)
+    {
+        if (!hasProvisionalGroundReference &&
+            Volatile.Read(
+                ref isGroundAnchorProvisional) ==
+                    0)
+        {
+            return;
+        }
+
+        hasProvisionalGroundReference =
+            false;
+
+        provisionalGroundX =
+            0.0f;
+
+        provisionalGroundY =
+            0.0f;
+
+        provisionalGroundZ =
+            0.0f;
+
+        Volatile.Write(
+            ref isGroundAnchorProvisional,
+            0);
+
+        Log.Debug(
+            SpatialPoseTag,
+            "Provisional ground reference cleared: " +
+            reason +
+            ". Verified-anchor placement/rebase is now authoritative.");
+    }
+
+    private void RegisterProvisionalGroundVerification()
+    {
+        long replacementGeneration;
+
+        lock (groundAnchorRecoveryLock)
+        {
+            groundAnchorReplacementGeneration++;
+
+            replacementGeneration =
+                groundAnchorReplacementGeneration;
+
+            groundAnchorReacquisitionArmed =
+                false;
+
+            replacementAnchorSearchStartedTimestamp =
+                long.MinValue;
+
+            replacementAnchorSearchNoticeLogged =
+                false;
+        }
+
+        ARCameraSpatialController.SetRouteRecoveryRebasePending(
+            true,
+            "verified floor replaced provisional ground reference");
+
+        Log.Debug(
+            SpatialPoseTag,
+            "PROVISIONAL GROUND VERIFIED: ARCore Plane/Depth is now " +
+            "authoritative. Requesting one current-window route rebase: " +
+            $"replacementGeneration={replacementGeneration}.");
+    }
+
     private void ReleaseSpatialGroundAnchor()
     {
         groundDepthRequested =
             true;
+
+        ARGroundStateBridge.InvalidateAndSearch(
+            ARRenderGenerationBridge.Current,
+            recovering: true,
+            "ground reference released; replacement required");
+
+        ClearProvisionalGroundReference(
+            "ground-anchor state was released");
 
         Google.AR.Core.Anchor? anchor =
             Interlocked.Exchange(
@@ -2623,7 +3138,8 @@ public sealed partial class ArCoreService : IArCoreService
     private void LogTrackingTransitionIfNeeded(
         string trackingState,
         string trackingFailureReason,
-        long timestamp)
+        long timestamp,
+        ARTrackingStateBridge.TrackingSnapshot snapshot)
     {
         bool stateChanged =
             !string.Equals(
@@ -2653,10 +3169,18 @@ public sealed partial class ArCoreService : IArCoreService
 
         Log.Debug(
             SpatialPoseTag,
-            "ARCore tracking transition: " +
+            "ARCORE_TRACKING_TRANSITION " +
             $"{previousState} -> {trackingState}; " +
             $"failure {previousFailureReason} -> {trackingFailureReason}; " +
-            $"frameTimestamp={timestamp}");
+            $"frameTimestamp={timestamp}; " +
+            $"sessionGeneration={snapshot.SessionGeneration}; " +
+            $"depthEnabled={snapshot.DepthEnabled}; " +
+            $"activePauses={snapshot.ActivePauseTransitionCount}; " +
+            $"lifecyclePauses={snapshot.LifecyclePauseTransitionCount}; " +
+            $"recoveries={snapshot.RecoveryTransitionCount}; " +
+            $"lossStart={snapshot.LossStartedAtUtc?.ToString("O") ?? "<none>"}; " +
+            $"lastLossDurationMs={snapshot.LastLossDurationMilliseconds}; " +
+            $"recoveryTransition='{snapshot.RecoveryTransition}'");
 
         if (trackingState.Equals(
                 "Tracking",
@@ -2853,9 +3377,14 @@ public sealed partial class ArCoreService : IArCoreService
     private void TryPublishDepthOcclusionFrame(
         Frame frame,
         ArCoreCamera camera,
-        long timestamp,
-        float zoomRatio)
+        float zoomRatio,
+        ARFrameMetadata frameMetadata)
     {
+        long timestamp =
+            frameMetadata.FrameTimestamp;
+
+        long now = Environment.TickCount64;
+
         ARFloodDepthBridge.FloodDepthSnapshot flood =
             ARFloodDepthBridge.Current;
 
@@ -2883,10 +3412,19 @@ public sealed partial class ArCoreService : IArCoreService
             return;
         }
 
+        if (!CanAttemptDepthAcquisition(now))
+        {
+            return;
+        }
+
         if (!camera.TrackingState.ToString().Equals(
                 "Tracking",
                 StringComparison.OrdinalIgnoreCase))
         {
+            RegisterDepthAcquisitionFailure(
+                now,
+                DepthFailureKind.TimestampUnavailable,
+                "camera tracking is unavailable");
             return;
         }
 
@@ -2908,10 +3446,18 @@ public sealed partial class ArCoreService : IArCoreService
             return;
         }
 
+        ushort[]? depthMillimeters = null;
+        bool depthBufferOwnershipTransferred = false;
+
         try
         {
             using global::Android.Media.Image depthImage =
                 frame.AcquireDepthImage16Bits();
+
+            ArCoreJniOwnershipDiagnostics.Record(
+                "DepthImage",
+                "Frame.AcquireDepthImage16Bits",
+                "USING_DISPOSE");
 
             int width =
                 depthImage.Width;
@@ -2922,15 +3468,28 @@ public sealed partial class ArCoreService : IArCoreService
             if (width <= 0 ||
                 height <= 0)
             {
+                RegisterDepthAcquisitionFailure(
+                    now,
+                    DepthFailureKind.InvalidFrame,
+                    $"invalid depth dimensions {width}x{height}");
                 return;
             }
 
             global::Android.Media.Image.Plane[]? planes =
                 depthImage.GetPlanes();
 
+            ArCoreJniOwnershipDiagnostics.Record(
+                "ImagePlaneArray",
+                "DepthImage.GetPlanes",
+                "BORROWED_WRAPPERS");
+
             if (planes is null ||
                 planes.Length < 1)
             {
+                RegisterDepthAcquisitionFailure(
+                    now,
+                    DepthFailureKind.InvalidFrame,
+                    "depth image contains no planes");
                 return;
             }
 
@@ -2942,6 +3501,10 @@ public sealed partial class ArCoreService : IArCoreService
 
             if (buffer is null)
             {
+                RegisterDepthAcquisitionFailure(
+                    now,
+                    DepthFailureKind.InvalidFrame,
+                    "depth plane buffer is null");
                 return;
             }
 
@@ -2954,11 +3517,19 @@ public sealed partial class ArCoreService : IArCoreService
             if (rowStride <= 0 ||
                 pixelStride <= 0)
             {
+                RegisterDepthAcquisitionFailure(
+                    now,
+                    DepthFailureKind.InvalidFrame,
+                    $"invalid depth strides row={rowStride}, pixel={pixelStride}");
                 return;
             }
 
-            ushort[] depthMillimeters =
-                new ushort[width * height];
+            int pixelCount = checked(width * height);
+
+            depthMillimeters =
+                System.Buffers.ArrayPool<ushort>.Shared.Rent(pixelCount);
+
+            int validDepthPixelCount = 0;
 
             for (int y = 0;
                  y < height;
@@ -2986,10 +3557,28 @@ public sealed partial class ArCoreService : IArCoreService
                     byte high =
                         unchecked((byte)buffer.Get(byteIndex + 1));
 
-                    depthMillimeters[
-                        destinationRow + x] =
+                    ushort depthValue =
                         (ushort)(low | (high << 8));
+
+                    depthMillimeters[destinationRow + x] = depthValue;
+
+                    if (depthValue is >= 180 and <= 8_000)
+                    {
+                        validDepthPixelCount++;
+                    }
                 }
+            }
+
+            int minimumValidDepthPixels = Math.Max(64, pixelCount / 100);
+
+            if (validDepthPixelCount < minimumValidDepthPixels)
+            {
+                RegisterDepthAcquisitionFailure(
+                    now,
+                    DepthFailureKind.InvalidFrame,
+                    $"valid depth coverage {validDepthPixelCount}/{pixelCount} below " +
+                    $"minimum {minimumValidDepthPixels}");
+                return;
             }
 
             using CameraIntrinsics? intrinsics =
@@ -2997,6 +3586,10 @@ public sealed partial class ArCoreService : IArCoreService
 
             if (intrinsics is null)
             {
+                RegisterDepthAcquisitionFailure(
+                    now,
+                    DepthFailureKind.InvalidFrame,
+                    "camera texture intrinsics unavailable");
                 return;
             }
 
@@ -3016,6 +3609,10 @@ public sealed partial class ArCoreService : IArCoreService
                 dimensions is null ||
                 dimensions.Length < 2)
             {
+                RegisterDepthAcquisitionFailure(
+                    now,
+                    DepthFailureKind.InvalidFrame,
+                    "camera texture intrinsics are incomplete");
                 return;
             }
 
@@ -3024,6 +3621,10 @@ public sealed partial class ArCoreService : IArCoreService
 
             if (physicalPose is null)
             {
+                RegisterDepthAcquisitionFailure(
+                    now,
+                    DepthFailureKind.InvalidFrame,
+                    "physical camera pose unavailable");
                 return;
             }
 
@@ -3046,20 +3647,27 @@ public sealed partial class ArCoreService : IArCoreService
                     frame,
                     zoomRatio);
 
-            ARCameraPoseBridge.SpatialSnapshot spatial =
-                ARCameraPoseBridge.CurrentFrame;
+            bool matchingSpatialFrame =
+                ARCameraPoseBridge.TryGetFrameForMetadata(
+                    frameMetadata,
+                    0,
+                    out ARCameraPoseBridge.SpatialSnapshot spatial,
+                    out _);
 
-            bool groundAvailable =
-                spatial.FrameTimestamp == timestamp &&
-                spatial.Anchor.IsAvailable;
+            ARGroundStateBridge.GroundStateSnapshot groundState =
+                matchingSpatialFrame
+                    ? spatial.Anchor.GroundState
+                    : ARGroundStateBridge.GroundStateSnapshot.Unavailable;
+
+            bool groundAvailable = groundState.HasGroundReference;
 
             float groundWorldY =
                 groundAvailable
                     ? spatial.Anchor.PositionY
                     : 0.0f;
 
-            ARDepthOcclusionBridge.Publish(
-                timestamp,
+            bool published = ARDepthOcclusionBridge.Publish(
+                frameMetadata,
                 width,
                 height,
                 depthMillimeters,
@@ -3077,8 +3685,20 @@ public sealed partial class ArCoreService : IArCoreService
                 principalPoint[1],
                 dimensions[0],
                 dimensions[1],
-                groundAvailable,
+                groundState,
                 groundWorldY);
+
+            if (!published)
+            {
+                RegisterDepthAcquisitionFailure(
+                    now,
+                    DepthFailureKind.PublishRejected,
+                    "depth bridge rejected frame metadata or dimensions");
+                return;
+            }
+
+            depthBufferOwnershipTransferred = true;
+            RegisterDepthAcquisitionSuccess(now);
 
             lastDepthOcclusionPublishTimestamp =
                 timestamp;
@@ -3105,35 +3725,27 @@ public sealed partial class ArCoreService : IArCoreService
         }
         catch (Exception exception)
         {
-            _ = exception;
+            bool timestampUnavailable =
+                exception.GetType().Name.Contains(
+                    "NotYetAvailable",
+                    StringComparison.OrdinalIgnoreCase);
 
-            /*
-             * NotYetAvailableException is expected while depth is warming up,
-             * and other ARCore depth exceptions can occur transiently during
-             * tracking loss. Keep the last good depth frame instead of
-             * tearing down active flood or route occlusion.
-             */
-#if DEBUG
-            long now =
-                Environment.TickCount64;
-
-            if (!depthOcclusionAvailabilityLogged &&
-                (lastDepthOcclusionWaitingLogTimestamp ==
-                    long.MinValue ||
-                 now -
-                    lastDepthOcclusionWaitingLogTimestamp >=
-                        powerThermalDecision
-                            .DiagnosticLogIntervalMilliseconds))
+            RegisterDepthAcquisitionFailure(
+                now,
+                timestampUnavailable
+                    ? DepthFailureKind.TimestampUnavailable
+                    : DepthFailureKind.InvalidFrame,
+                $"{exception.GetType().Name}: {exception.Message}");
+        }
+        finally
+        {
+            if (depthMillimeters is not null &&
+                !depthBufferOwnershipTransferred)
             {
-                lastDepthOcclusionWaitingLogTimestamp =
-                    now;
-
-                Log.Debug(
-                    "RescuAR-FloodDepth",
-                    "ARCore depth occlusion waiting for a usable depth frame: " +
-                    $"{exception.GetType().Name}: {exception.Message}");
+                System.Buffers.ArrayPool<ushort>.Shared.Return(
+                    depthMillimeters,
+                    clearArray: false);
             }
-#endif
         }
     }
 
@@ -3269,6 +3881,7 @@ public sealed partial class ArCoreService : IArCoreService
         int rotation;
         int width;
         int height;
+        long geometryGeneration;
         bool shouldApply;
 
         lock (displayGeometryLock)
@@ -3293,6 +3906,9 @@ public sealed partial class ArCoreService : IArCoreService
 
             height =
                 requestedDisplayHeight;
+
+            geometryGeneration =
+                requestedDisplayGeometryGeneration;
         }
 
         currentSession.SetDisplayGeometry(
@@ -3311,6 +3927,9 @@ public sealed partial class ArCoreService : IArCoreService
             appliedDisplayHeight =
                 height;
 
+            appliedDisplayGeometryGeneration =
+                geometryGeneration;
+
             displayGeometryDirty =
                 requestedDisplayRotation != rotation ||
                 requestedDisplayWidth != width ||
@@ -3320,6 +3939,8 @@ public sealed partial class ArCoreService : IArCoreService
         hasLoggedTransformedUv =
             false;
 
+        ActivateRenderGenerationIfReady();
+
         Log.Debug(
             Tag,
             "ARCore display geometry applied: " +
@@ -3328,125 +3949,50 @@ public sealed partial class ArCoreService : IArCoreService
             $"height={height}");
     }
 
-    private void TryCaptureInitialDisplayGeometry()
+    private ARRenderGenerationToken CaptureRenderGeneration(
+        long sessionGeneration)
     {
+        long geometryGeneration;
+
         lock (displayGeometryLock)
         {
-            if (displayGeometryAvailable)
-            {
-                Log.Debug(
-                    Tag,
-                    "Skipping DecorView display geometry fallback because " +
-                    "Evergine viewport geometry is already available.");
-
-                return;
-            }
+            geometryGeneration =
+                appliedDisplayGeometryGeneration;
         }
 
-        Activity? currentActivity =
-            Platform.CurrentActivity;
-
-        if (currentActivity is null)
-        {
-            Log.Warn(
-                Tag,
-                "Unable to capture initial display geometry because " +
-                "Platform.CurrentActivity is null.");
-
-            return;
-        }
-
-        var display =
-            currentActivity.WindowManager?.DefaultDisplay;
-
-        var decorView =
-            currentActivity.Window?.DecorView;
-
-        if (display is null ||
-            decorView is null)
-        {
-            Log.Warn(
-                Tag,
-                "Unable to capture initial ARCore display geometry.");
-
-            return;
-        }
-
-        int width =
-            decorView.Width;
-
-        int height =
-            decorView.Height;
-
-        if (width <= 0 ||
-            height <= 0)
-        {
-            Log.Warn(
-                Tag,
-                $"Invalid DecorView size: {width}x{height}");
-
-            return;
-        }
-
-        SetDisplayGeometry(
-            (int)display.Rotation,
-            width,
-            height);
-
-        Log.Debug(
-            Tag,
-            "Initial ARCore display geometry captured from Android DecorView.");
+        return new ARRenderGenerationToken(
+            sessionGeneration,
+            Interlocked.Read(ref graphicsGeneration),
+            geometryGeneration);
     }
 
-    /*
-     * Full shutdown helper retained for initialization failure/application
-     * destruction paths. Do not use this method for normal Camera-tab exit,
-     * because it intentionally releases the spatial anchor.
-     */
-    private void StopFrameLoop()
+    private void ActivateRenderGenerationIfReady()
     {
-        CancellationTokenSource? cancellation =
-            frameLoopCancellation;
+        ARRenderGenerationToken token =
+            CaptureRenderGeneration(
+                Interlocked.Read(ref currentSessionGeneration));
 
-        frameLoopCancellation =
-            null;
-
-        if (cancellation is null)
+        if (!token.IsValid ||
+            graphicsContext is null ||
+            session is null ||
+            sessionPaused)
         {
             return;
         }
 
-        try
-        {
-            cancellation.Cancel();
-        }
-        catch
-        {
-            // Best-effort shutdown.
-        }
-
-        cancellation.Dispose();
-
-        ReleasePendingCameraFrame();
-
-        ReleaseSpatialGroundAnchor();
-
-        frameLoopTask =
-            null;
-
-        Log.Debug(
-            Tag,
-            "Automatic ARCore frame loop stop requested.");
+        ARRenderGenerationBridge.Activate(token);
+        ARCameraTextureBridge.ResumeProcessing(
+            token.GraphicsGeneration);
     }
 
-    private static ARCoreVulkanImporter CreateImporter(
+    private static IArCameraFrameImporter CreateImporter(
         VKGraphicsContext graphicsContext)
     {
         Log.Debug(
             Tag,
             "Creating ARCore Vulkan importer...");
 
-        return new ARCoreVulkanImporter(
+        return new EvergineArCameraFrameImporter(
             graphicsContext);
     }
 
@@ -3490,9 +4036,21 @@ public sealed partial class ArCoreService : IArCoreService
     {
         ReleaseSpatialGroundAnchor();
 
+        InvalidatePublishedSessionState();
+
         try
         {
-            session?.Close();
+            Session? failedSession =
+                session;
+
+            try
+            {
+                failedSession?.Close();
+            }
+            finally
+            {
+                failedSession?.Dispose();
+            }
         }
         catch (Exception exception)
         {
@@ -3568,7 +4126,8 @@ public sealed partial class ArCoreService : IArCoreService
                     automaticDepthMode);
 
             config.SetDepthMode(
-                isSupported
+                isSupported &&
+                !forceDepthDisabledForExperiment
                     ? automaticDepthMode
                     : Google.AR.Core.Config.DepthMode.Disabled);
 
@@ -3576,7 +4135,8 @@ public sealed partial class ArCoreService : IArCoreService
                 Tag,
                 "ARCore Depth API configuration: " +
                 $"supported={isSupported}, " +
-                $"requested={(isSupported ? "AUTOMATIC" : "DISABLED")}. " +
+                $"experimentMode={depthExperimentMode}, " +
+                $"requested={(isSupported && !forceDepthDisabledForExperiment ? "AUTOMATIC" : "DISABLED")}. " +
                 "Ground acquisition uses spatially supported Plane hits first and rolling-confidence DepthPoint fallback when enabled.");
 
             return isSupported;
@@ -4318,124 +4878,4 @@ public sealed partial class ArCoreService : IArCoreService
         return filePath;
     }
 
-    private static void SelectThirtyFpsCameraConfig(
-        Session currentSession)
-    {
-        try
-        {
-            CameraConfig? currentConfig =
-                currentSession.CameraConfig;
-
-            if (currentConfig is null)
-            {
-                Log.Warn(
-                    Tag,
-                    "Current ARCore camera config unavailable.");
-
-                return;
-            }
-
-            global::Android.Util.Size currentGpuSize =
-                currentConfig.TextureSize;
-
-            using CameraConfigFilter cameraConfigFilter =
-                new(currentSession);
-
-            IList<CameraConfig> cameraConfigs =
-                currentSession.GetSupportedCameraConfigs(
-                    cameraConfigFilter);
-
-            CameraConfig? selectedConfig =
-                null;
-
-            foreach (CameraConfig candidate in cameraConfigs)
-            {
-                if (candidate.GetFacingDirection()
-                        .ToString() != "BACK")
-                {
-                    continue;
-                }
-
-                global::Android.Util.Size gpuSize =
-                    candidate.TextureSize;
-
-                /*
-                 * Preserve the GPU texture dimensions already proven to work
-                 * with the Vulkan camera pipeline.
-                 */
-                if (gpuSize.Width != currentGpuSize.Width ||
-                    gpuSize.Height != currentGpuSize.Height)
-                {
-                    continue;
-                }
-
-                global::Android.Util.Range fpsRange =
-                    candidate.FpsRange;
-
-                int minimumFps =
-                    Convert.ToInt32(
-                        fpsRange.Lower?.ToString());
-
-                int maximumFps =
-                    Convert.ToInt32(
-                        fpsRange.Upper?.ToString());
-
-                if (minimumFps == 30 &&
-                    maximumFps == 30)
-                {
-                    selectedConfig =
-                        candidate;
-
-                    break;
-                }
-            }
-
-            if (selectedConfig is null)
-            {
-                Log.Warn(
-                    Tag,
-                    "No matching 30 FPS ARCore camera config found. " +
-                    "Default configuration retained.");
-
-                return;
-            }
-
-            /*
-             * Camera configuration is selected once while the Session is
-             * initially paused. Pause/resume tab transitions reuse it.
-             */
-            currentSession.CameraConfig =
-                selectedConfig;
-
-            Log.Debug(
-                Tag,
-                "========================================");
-
-            Log.Debug(
-                Tag,
-                "ARCore camera capped at 30 FPS.");
-
-            Log.Debug(
-                Tag,
-                $"FPS = {selectedConfig.FpsRange}");
-
-            Log.Debug(
-                Tag,
-                $"GPU Texture = " +
-                $"{selectedConfig.TextureSize.Width}x" +
-                $"{selectedConfig.TextureSize.Height}");
-
-            Log.Debug(
-                Tag,
-                "========================================");
-        }
-        catch (Exception exception)
-        {
-            Log.Warn(
-                Tag,
-                "Unable to select 30 FPS ARCore camera config. " +
-                $"{exception.GetType().Name}: " +
-                $"{exception.Message}");
-        }
-    }
 }
