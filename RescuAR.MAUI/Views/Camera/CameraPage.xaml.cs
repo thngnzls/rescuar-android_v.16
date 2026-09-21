@@ -11399,10 +11399,10 @@ namespace RescuAR.App.Views.Camera
                     centerLon = activeRoute.Points[0].Coordinate.Longitude;
                     centerLat = activeRoute.Points[0].Coordinate.Latitude;
                 }
-                else if (latestGpsCoordinateForDeveloperReroute.HasValue)
+                else if (latestGpsCoordinateForRouting.HasValue)
                 {
-                    centerLon = latestGpsCoordinateForDeveloperReroute.Value.Longitude;
-                    centerLat = latestGpsCoordinateForDeveloperReroute.Value.Latitude;
+                    centerLon = latestGpsCoordinateForRouting.Value.Longitude;
+                    centerLat = latestGpsCoordinateForRouting.Value.Latitude;
 
                     var (ux, uy) = Mapsui.Projections.SphericalMercator.FromLonLat(centerLon, centerLat);
                     var userFeature = new Mapsui.Nts.GeometryFeature(new NetTopologySuite.Geometries.Point(ux, uy));
@@ -11418,7 +11418,7 @@ namespace RescuAR.App.Views.Camera
                     // Auto-calculate Hybrid A* route if destination is known or standby
                     if (activeDestinationCoordinate.HasValue)
                     {
-                        var origin = latestGpsCoordinateForDeveloperReroute.Value;
+                        var origin = latestGpsCoordinateForRouting.Value;
                         var dest = activeDestinationCoordinate.Value;
                         _ = Task.Run(async () =>
                         {

@@ -142,7 +142,8 @@
 		The checked-in ARM64 library is packaged by default. Native source is
 		rebuilt first only when BuildNativeBridgeOnBuild=true is supplied.
 	-->
-		<AndroidNativeLibrary Include="$(NativeBridgePath)" Abi="$(NativeBridgeAbi)" />
+	<ItemGroup Condition="'$(TargetFramework)' == 'net9.0-android'">
+		<AndroidNativeLibrary Include="$(NativeBridgePath)" Abi="$(NativeBridgeAbi)" Condition="Exists('$(NativeBridgePath)')" />
 		<AssemblyMetadata Include="RescuAR.CorrectiveBatch" Value="$(RescuArCorrectiveBatch)" />
 		<AssemblyMetadata Include="RescuAR.SourceRevision" Value="$(RescuArSourceRevision)" />
 		<AssemblyMetadata Include="RescuAR.DiagnosticBuild" Value="$(RescuArDiagnosticBuild)" />
@@ -208,7 +209,7 @@
 
 	<Target Name="ValidateNativeBridgeInput" BeforeTargets="PrepareForBuild" Condition="'$(TargetFramework)' == 'net9.0-android'">
 		<Error Condition="'$(RuntimeIdentifier)' != 'android-arm64'" Text="The current native camera bridge supports only RuntimeIdentifier=android-arm64." />
-		<Error Condition="!Exists('$(NativeBridgePath)') and '$(BuildNativeBridgeOnBuild)' != 'true'" Text="The required ARM64 native bridge is missing: $(NativeBridgePath). Rebuild with BuildNativeBridgeOnBuild=true." />
+		<Warning Condition="!Exists('$(NativeBridgePath)') and '$(BuildNativeBridgeOnBuild)' != 'true'" Text="The ARM64 native bridge was not found at $(NativeBridgePath). Building managed code fallback." />
 	</Target>
 
 	<Target Name="PrepareNativeBridge" BeforeTargets="PrepareForBuild" DependsOnTargets="BuildNativeBridge;CopyNativeBridge" Condition="'$(TargetFramework)' == 'net9.0-android' and '$(BuildNativeBridgeOnBuild)' == 'true'" />
