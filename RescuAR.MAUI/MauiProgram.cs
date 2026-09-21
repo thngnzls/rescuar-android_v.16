@@ -51,6 +51,17 @@ public static class MauiProgram
             });
 
 #if ANDROID
+        // Remove default platform underlines from Pickers and Entries so custom Card borders look pristine
+        Microsoft.Maui.Handlers.EntryHandler.Mapper.AppendToMapping("NoUnderline", (handler, view) =>
+        {
+            handler.PlatformView.Background = null;
+            handler.PlatformView.SetBackgroundColor(Android.Graphics.Color.Transparent);
+        });
+        Microsoft.Maui.Handlers.PickerHandler.Mapper.AppendToMapping("NoUnderline", (handler, view) =>
+        {
+            handler.PlatformView.Background = null;
+            handler.PlatformView.SetBackgroundColor(Android.Graphics.Color.Transparent);
+        });
 
         builder.Services.AddSingleton<
             IArCoreService,
@@ -177,14 +188,22 @@ public static class MauiProgram
         // Batch 5: Profile
         builder.Services.AddTransient<ProfileViewModel>();
         builder.Services.AddTransient<ProfilePage>();
+        builder.Services.AddTransient<PersonalInformationViewModel>();
         builder.Services.AddTransient<PersonalInformationPage>();
         builder.Services.AddTransient<HealthInformationPage>();
+        builder.Services.AddTransient<SafetyCircleSettingsViewModel>();
         builder.Services.AddTransient<SafetyCircleSettingsPage>();
+        builder.Services.AddTransient<EmergencyContactsViewModel>();
         builder.Services.AddTransient<EmergencyContactsPage>();
+        builder.Services.AddTransient<AppSettingsViewModel>();
         builder.Services.AddTransient<AppSettingsPage>();
+        builder.Services.AddTransient<HelpCenterViewModel>();
         builder.Services.AddTransient<HelpCenterPage>();
+        builder.Services.AddTransient<PrivacyPolicyViewModel>();
         builder.Services.AddTransient<RescuAR.App.Views.Profile.PrivacyPolicyPage>();
+        builder.Services.AddTransient<TermsConditionsViewModel>();
         builder.Services.AddTransient<TermsConditionsPage>();
+        builder.Services.AddTransient<SystemInformationViewModel>();
         builder.Services.AddTransient<SystemInformationPage>();
 
 

@@ -1,13 +1,174 @@
 <?xml version="1.0" encoding="utf-8" ?>
-
 <ContentPage
     xmlns="http://schemas.microsoft.com/dotnet/2021/maui"
     xmlns:x="http://schemas.microsoft.com/winfx/2009/xaml"
+    xmlns:vm="clr-namespace:RescuAR.App.ViewModels.Profile"
     x:Class="RescuAR.App.Views.Profile.AppSettingsPage"
-    Title="App Settings">
+    x:DataType="vm:AppSettingsViewModel"
+    Shell.NavBarIsVisible="False"
+    BackgroundColor="#F2F2F7">
 
-    <VerticalStackLayout>
-        <Label Text="Placeholder" />
-    </VerticalStackLayout>
+    <Grid RowDefinitions="Auto,*">
+        <!-- Top App Bar -->
+        <Grid Grid.Row="0" ColumnDefinitions="Auto,*,Auto" Padding="20,15" BackgroundColor="#F2F2F7">
+            <Button
+                Grid.Column="0"
+                Text="&lt; Back"
+                FontSize="15"
+                FontAttributes="Bold"
+                TextColor="#0F172A"
+                BackgroundColor="Transparent"
+                Padding="0"
+                Command="{Binding BackCommand}" />
 
-</ContentPage>
+            <Label
+                Grid.Column="1"
+                Text="RescuAR"
+                FontSize="16"
+                FontAttributes="Bold"
+                TextColor="#0F172A"
+                HorizontalOptions="Center"
+                VerticalOptions="Center" />
+
+            <ImageButton
+                Grid.Column="2"
+                Source="ic_notification.png"
+                WidthRequest="24"
+                HeightRequest="24"
+                BackgroundColor="Transparent" />
+        </Grid>
+
+        <!-- Main Scrollable Content -->
+        <ScrollView Grid.Row="1">
+            <VerticalStackLayout Spacing="20" Padding="20,5,20,30">
+                <!-- Breadcrumb & Title -->
+                <VerticalStackLayout Spacing="4">
+                    <Label Text="Profile/" FontSize="14" TextColor="#64748B" />
+                    <Label Text="App Settings" FontSize="30" FontAttributes="Bold" TextColor="#0F172A" />
+                    <Label Text="Customize notifications, offline data behavior, and application preferences." FontSize="13" TextColor="#64748B" />
+                </VerticalStackLayout>
+
+                <!-- Section: Alerts & Notifications -->
+                <VerticalStackLayout Spacing="8">
+                    <Label Text="Alerts &amp; Notifications" FontSize="16" FontAttributes="Bold" TextColor="#0F172A" Margin="4,0" />
+                    <Border StrokeShape="RoundRectangle 16" Stroke="#E2E8F0" StrokeThickness="1" BackgroundColor="White" Padding="16">
+                        <VerticalStackLayout Spacing="16">
+                            <!-- Push Notifications -->
+                            <Grid ColumnDefinitions="*,Auto" ColumnSpacing="12">
+                                <VerticalStackLayout Grid.Column="0" Spacing="2" VerticalOptions="Center">
+                                    <Label Text="Emergency Push Notifications" FontSize="14" FontAttributes="Bold" TextColor="#0F172A" />
+                                    <Label Text="Receive real-time typhoon, flood level, and disaster evacuation broadcasts." FontSize="12" TextColor="#64748B" />
+                                </VerticalStackLayout>
+                                <Switch Grid.Column="1" IsToggled="{Binding PushNotificationsEnabled}" OnColor="#0A8491" VerticalOptions="Center" />
+                            </Grid>
+
+                            <BoxView HeightRequest="1" Color="#F1F5F9" />
+
+                            <!-- Emergency Siren -->
+                            <Grid ColumnDefinitions="*,Auto" ColumnSpacing="12">
+                                <VerticalStackLayout Grid.Column="0" Spacing="2" VerticalOptions="Center">
+                                    <Label Text="Emergency Siren Sound" FontSize="14" FontAttributes="Bold" TextColor="#0F172A" />
+                                    <Label Text="Sound an audible alarm tone for critical life-safety alerts even when silent." FontSize="12" TextColor="#64748B" />
+                                </VerticalStackLayout>
+                                <Switch Grid.Column="1" IsToggled="{Binding EmergencySirenEnabled}" OnColor="#0A8491" VerticalOptions="Center" />
+                            </Grid>
+
+                            <BoxView HeightRequest="1" Color="#F1F5F9" />
+
+                            <!-- Haptic Feedback -->
+                            <Grid ColumnDefinitions="*,Auto" ColumnSpacing="12">
+                                <VerticalStackLayout Grid.Column="0" Spacing="2" VerticalOptions="Center">
+                                    <Label Text="Vibration &amp; Haptic Alerts" FontSize="14" FontAttributes="Bold" TextColor="#0F172A" />
+                                    <Label Text="Vibrate during turn-by-turn AR cues and urgent hazard warnings." FontSize="12" TextColor="#64748B" />
+                                </VerticalStackLayout>
+                                <Switch Grid.Column="1" IsToggled="{Binding HapticFeedbackEnabled}" OnColor="#0A8491" VerticalOptions="Center" />
+                            </Grid>
+                        </VerticalStackLayout>
+                    </Border>
+                </VerticalStackLayout>
+
+                <!-- Section: Offline & Storage -->
+                <VerticalStackLayout Spacing="8">
+                    <Label Text="Offline Data &amp; Storage" FontSize="16" FontAttributes="Bold" TextColor="#0F172A" Margin="4,0" />
+                    <Border StrokeShape="RoundRectangle 16" Stroke="#E2E8F0" StrokeThickness="1" BackgroundColor="White" Padding="16">
+                        <VerticalStackLayout Spacing="16">
+                            <!-- Offline Map Caching -->
+                            <Grid ColumnDefinitions="*,Auto" ColumnSpacing="12">
+                                <VerticalStackLayout Grid.Column="0" Spacing="2" VerticalOptions="Center">
+                                    <Label Text="Offline Map &amp; Routing Cache" FontSize="14" FontAttributes="Bold" TextColor="#0F172A" />
+                                    <Label Text="Automatically cache Marikina street networks and evacuation shelters for offline use." FontSize="12" TextColor="#64748B" />
+                                </VerticalStackLayout>
+                                <Switch Grid.Column="1" IsToggled="{Binding OfflineMapCachingEnabled}" OnColor="#0A8491" VerticalOptions="Center" />
+                            </Grid>
+
+                            <BoxView HeightRequest="1" Color="#F1F5F9" />
+
+                            <!-- Clear Cache Row -->
+                            <Grid ColumnDefinitions="*,Auto" ColumnSpacing="12">
+                                <VerticalStackLayout Grid.Column="0" Spacing="2" VerticalOptions="Center">
+                                    <Label Text="Cached Map &amp; Media Data" FontSize="14" FontAttributes="Bold" TextColor="#0F172A" />
+                                    <HorizontalStackLayout Spacing="4">
+                                        <Label Text="Current size: " FontSize="12" TextColor="#64748B" />
+                                        <Label Text="{Binding CacheSizeText}" FontSize="12" FontAttributes="Bold" TextColor="#0A8491" />
+                                    </HorizontalStackLayout>
+                                </VerticalStackLayout>
+                                <Button
+                                    Grid.Column="1"
+                                    Text="Clear Cache"
+                                    FontSize="12"
+                                    FontAttributes="Bold"
+                                    TextColor="#DC2626"
+                                    BackgroundColor="#FEE2E2"
+                                    CornerRadius="8"
+                                    HeightRequest="36"
+                                    Padding="12,0"
+                                    Command="{Binding ClearCacheCommand}"
+                                    VerticalOptions="Center" />
+                            </Grid>
+                        </VerticalStackLayout>
+                    </Border>
+                </VerticalStackLayout>
+
+                <!-- Section: Device Permissions -->
+                <VerticalStackLayout Spacing="8">
+                    <Label Text="Device Permissions" FontSize="16" FontAttributes="Bold" TextColor="#0F172A" Margin="4,0" />
+                    <Border StrokeShape="RoundRectangle 16" Stroke="#E2E8F0" StrokeThickness="1" BackgroundColor="White" Padding="16">
+                        <VerticalStackLayout Spacing="12">
+                            <Grid ColumnDefinitions="*,Auto">
+                                <Label Grid.Column="0" Text="Camera Access (AR Guidance)" FontSize="14" TextColor="#334155" VerticalOptions="Center" />
+                                <Label Grid.Column="1" Text="{Binding IsCameraGranted, Converter={StaticResource BooleanToStringConverter}, FallbackValue='Granted'}" FontSize="13" FontAttributes="Bold" TextColor="#16A34A" VerticalOptions="Center" />
+                            </Grid>
+
+                            <BoxView HeightRequest="1" Color="#F1F5F9" />
+
+                            <Grid ColumnDefinitions="*,Auto">
+                                <Label Grid.Column="0" Text="GPS Location (Routing &amp; Safety Circle)" FontSize="14" TextColor="#334155" VerticalOptions="Center" />
+                                <Label Grid.Column="1" Text="{Binding IsLocationGranted, Converter={StaticResource BooleanToStringConverter}, FallbackValue='Granted'}" FontSize="13" FontAttributes="Bold" TextColor="#16A34A" VerticalOptions="Center" />
+                            </Grid>
+
+                            <BoxView HeightRequest="1" Color="#F1F5F9" />
+
+                            <Grid ColumnDefinitions="*,Auto">
+                                <Label Grid.Column="0" Text="Push Notifications (Disaster Alerts)" FontSize="14" TextColor="#334155" VerticalOptions="Center" />
+                                <Label Grid.Column="1" Text="{Binding IsNotificationsGranted, Converter={StaticResource BooleanToStringConverter}, FallbackValue='Granted'}" FontSize="13" FontAttributes="Bold" TextColor="#16A34A" VerticalOptions="Center" />
+                            </Grid>
+
+                            <BoxView HeightRequest="1" Color="#F1F5F9" />
+
+                            <Button
+                                Text="Manage in Device Settings &gt;"
+                                FontSize="14"
+                                FontAttributes="Bold"
+                                TextColor="#0A8491"
+                                BackgroundColor="Transparent"
+                                HorizontalOptions="Start"
+                                Padding="0"
+                                Margin="0,4,0,0"
+                                Command="{Binding OpenDeviceSettingsCommand}" />
+                        </VerticalStackLayout>
+                    </Border>
+                </VerticalStackLayout>
+            </VerticalStackLayout>
+        </ScrollView>
+    </Grid>
+</ContentPage>

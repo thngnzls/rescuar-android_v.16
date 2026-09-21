@@ -21,6 +21,10 @@ using RescuAR.Navigation.Routing;
 using RescuAR.Navigation.State;
 using System.Numerics;
 using Microsoft.Maui.Networking;
+using Mapsui;
+using Mapsui.Nts;
+using Mapsui.Projections;
+using NetTopologySuite.Geometries;
 
 namespace RescuAR.App.Views.Camera
 {
@@ -170,6 +174,9 @@ namespace RescuAR.App.Views.Camera
         private CancellationTokenSource? emergencyAdvisoryAutoStartCancellation;
 
         private bool emergencyGuidanceStartInProgress;
+        private bool _isVoiceMuted;
+        private string _lastSpokenInstruction = string.Empty;
+        private CancellationTokenSource? _ttsCancellation;
 
         private enum CameraModuleViewMode
         {
@@ -738,6 +745,11 @@ namespace RescuAR.App.Views.Camera
 
                     RefreshEmergencyStatusBanner();
                     RefreshCameraModuleDynamicUi();
+
+                    if (mapMode)
+                    {
+                        InitializeOrRefresh2DCameraMap();
+                    }
                 });
 
 #if ANDROID
@@ -5017,6 +5029,14 @@ namespace RescuAR.App.Views.Camera
             turnDistanceLabel.Text =
                 $"{Math.Max(0.0, guidance.RemainingRouteMeters):F0} meters away from the " +
                 "nearest evacuation center";
+
+            if (!_isVoiceMuted &&
+                !string.IsNullOrWhiteSpace(turnInstructionLabel.Text) &&
+                !string.Equals(turnInstructionLabel.Text, _lastSpokenInstruction, StringComparison.OrdinalIgnoreCase))
+            {
+                _lastSpokenInstruction = turnInstructionLabel.Text;
+                _ = SpeakTurnInstructionAsync(turnInstructionLabel.Text);
+            }
         }
 
         private void ApplyPrototypeHazardReroutingState(
@@ -8849,7 +8869,7 @@ namespace RescuAR.App.Views.Camera
             if (navigationAwarenessSheet != null) navigationAwarenessSheet.IsVisible = false;
 
             // Initialize 2D Map Control if needed
-            Initialize2DCameraMap();
+            InitializeOrRefresh2DCameraMap();
         }
 
         private void OnFloodGuidanceOptionClicked(object sender, EventArgs e)
@@ -8908,20 +8928,481 @@ namespace RescuAR.App.Views.Camera
             catch { }
         }
 
-        private void Initialize2DCameraMap()
+        private void InitializeOrRefresh2DCameraMap()
         {
             try
             {
-                if (CameraMapControl != null && CameraMapControl.Map == null)
+                if (CameraMapControl == null) return;
+
+                if (CameraMapControl.Map == null)
                 {
-                    var map = new Mapsui.Map();
-                    map.Layers.Add(Mapsui.Tiling.OpenStreetMap.CreateTileLayer());
+                    var map = new Mapsui.Map
+                    {
+                        CRS = "EPSG:3857"
+                    };
+                    map.Widgets.Clear();
                     CameraMapControl.Map = map;
                 }
+
+                var currentMap = CameraMapControl.Map;
+                if (currentMap == null) return;
+                currentMap.Widgets.Clear();
+
+                // 1. Ensure accurate Marikina GeoJSON Road Network from Navigation Data Bootstrap is rendered
+                _ = EnsureCamera2DGeoJsonLoadedAsync(currentMap);
+
+                // 2. Remove existing dynamic route & marker layers
+                var existingRoute = currentMap.Layers.FirstOrDefault(l => l.Name == "Camera2DRouteLayer");
+                if (existingRoute != null) currentMap.Layers.Remove(existingRoute);
+
+                var existingMarkers = currentMap.Layers.FirstOrDefault(l => l.Name == "Camera2DMarkersLayer");
+                if (existingMarkers != null) currentMap.Layers.Remove(existingMarkers);
+
+                var routeFeatures = new System.Collections.Generic.List<Mapsui.Nts.GeometryFeature>();
+                var markerFeatures = new System.Collections.Generic.List<Mapsui.Nts.GeometryFeature>();
+
+                double centerLon = 121.1029;
+                double centerLat = 14.6507;
+
+                // 3. Render Predefined Marikina Evacuation Shelters on 2D Map
+                try
+                {
+                    var shelters = EvacuationCenterRepository.GetEvacuationCenters();
+                    if (shelters != null)
+                    {
+                        foreach (var shelter in shelters)
+                        {
+                            var (sx, sy) = Mapsui.Projections.SphericalMercator.FromLonLat(shelter.Longitude, shelter.Latitude);
+                            var shelterFeature = new Mapsui.Nts.GeometryFeature(new NetTopologySuite.Geometries.Point(sx, sy));
+                            
+                            // Safe-Haven Evacuation Shelter Marker
+                            shelterFeature.Styles.Add(new Mapsui.Styles.SymbolStyle
+                            {
+                                SymbolType = Mapsui.Styles.SymbolType.Ellipse,
+                                SymbolScale = 1.0,
+                                Fill = new Mapsui.Styles.Brush(new Mapsui.Styles.Color(22, 163, 74, 235)), // Emerald Safe Zone #16A34A
+                                Outline = new Mapsui.Styles.Pen(Mapsui.Styles.Color.White, 2)
+                            });
+
+                            // Shelter Label
+                            if (!string.IsNullOrWhiteSpace(shelter.Name))
+                            {
+                                shelterFeature.Styles.Add(new Mapsui.Styles.LabelStyle
+                                {
+                                    Text = shelter.Name,
+                                    ForeColor = new Mapsui.Styles.Color(15, 23, 42),
+                                    BackColor = new Mapsui.Styles.Brush(new Mapsui.Styles.Color(255, 255, 255, 220)),
+                                    Font = new Mapsui.Styles.Font { FontFamily = "Arial", Size = 9.5, Bold = true },
+                                    Offset = new Mapsui.Styles.Offset(0, -18),
+                                    HorizontalAlignment = Mapsui.Styles.LabelStyle.HorizontalAlignmentEnum.Center
+                                });
+                            }
+
+                            markerFeatures.Add(shelterFeature);
+                        }
+                    }
+                }
+                catch { }
+
+                // 4. Plot active route (same calculation from Hybrid A* / MLD as AR guidance)
+                if (activeRoute != null && activeRoute.Points != null && activeRoute.Points.Count >= 2)
+                {
+                    var coordinates = new System.Collections.Generic.List<NetTopologySuite.Geometries.Coordinate>();
+                    foreach (var pt in activeRoute.Points)
+                    {
+                        var (x, y) = Mapsui.Projections.SphericalMercator.FromLonLat(pt.Coordinate.Longitude, pt.Coordinate.Latitude);
+                        coordinates.Add(new NetTopologySuite.Geometries.Coordinate(x, y));
+                    }
+
+                    var lineString = new NetTopologySuite.Geometries.LineString(coordinates.ToArray());
+                    var routeFeature = new Mapsui.Nts.GeometryFeature(lineString);
+                    routeFeature.Styles.Add(new Mapsui.Styles.VectorStyle
+                    {
+                        Line = new Mapsui.Styles.Pen
+                        {
+                            Color = new Mapsui.Styles.Color(10, 132, 145, 245), // Vibrant Brand Cyan #0A8491
+                            Width = 7
+                        }
+                    });
+                    routeFeatures.Add(routeFeature);
+
+                    // Origin Pin (User Start Location)
+                    var startCoord = coordinates.First();
+                    var startFeature = new Mapsui.Nts.GeometryFeature(new NetTopologySuite.Geometries.Point(startCoord));
+                    startFeature.Styles.Add(new Mapsui.Styles.SymbolStyle
+                    {
+                        SymbolType = Mapsui.Styles.SymbolType.Ellipse,
+                        SymbolScale = 1.0,
+                        Fill = new Mapsui.Styles.Brush(new Mapsui.Styles.Color(10, 132, 145)),
+                        Outline = new Mapsui.Styles.Pen(Mapsui.Styles.Color.White, 2)
+                    });
+                    markerFeatures.Add(startFeature);
+
+                    // Destination Pin (Target Evacuation Center)
+                    var endCoord = coordinates.Last();
+                    var destFeature = new Mapsui.Nts.GeometryFeature(new NetTopologySuite.Geometries.Point(endCoord));
+                    destFeature.Styles.Add(new Mapsui.Styles.SymbolStyle
+                    {
+                        SymbolType = Mapsui.Styles.SymbolType.Triangle,
+                        SymbolScale = 1.3,
+                        Fill = new Mapsui.Styles.Brush(new Mapsui.Styles.Color(220, 38, 38)), // Red Destination Pin
+                        Outline = new Mapsui.Styles.Pen(Mapsui.Styles.Color.White, 2)
+                    });
+                    markerFeatures.Add(destFeature);
+
+                    centerLon = activeRoute.Points[0].Coordinate.Longitude;
+                    centerLat = activeRoute.Points[0].Coordinate.Latitude;
+                }
+                else if (latestGpsCoordinateForDeveloperReroute.HasValue)
+                {
+                    centerLon = latestGpsCoordinateForDeveloperReroute.Value.Longitude;
+                    centerLat = latestGpsCoordinateForDeveloperReroute.Value.Latitude;
+
+                    var (ux, uy) = Mapsui.Projections.SphericalMercator.FromLonLat(centerLon, centerLat);
+                    var userFeature = new Mapsui.Nts.GeometryFeature(new NetTopologySuite.Geometries.Point(ux, uy));
+                    userFeature.Styles.Add(new Mapsui.Styles.SymbolStyle
+                    {
+                        SymbolType = Mapsui.Styles.SymbolType.Ellipse,
+                        SymbolScale = 1.0,
+                        Fill = new Mapsui.Styles.Brush(new Mapsui.Styles.Color(10, 132, 145)),
+                        Outline = new Mapsui.Styles.Pen(Mapsui.Styles.Color.White, 2)
+                    });
+                    markerFeatures.Add(userFeature);
+
+                    // Auto-calculate Hybrid A* route if destination is known or standby
+                    if (activeDestinationCoordinate.HasValue)
+                    {
+                        var origin = latestGpsCoordinateForDeveloperReroute.Value;
+                        var dest = activeDestinationCoordinate.Value;
+                        _ = Task.Run(async () =>
+                        {
+                            try
+                            {
+                                var route = await _hybridRoutingService.FindOfflineRouteAsync(origin, dest);
+                                if (route != null && route.Points.Count >= 2)
+                                {
+                                    activeRoute = route;
+                                    MainThread.BeginInvokeOnMainThread(InitializeOrRefresh2DCameraMap);
+                                }
+                            }
+                            catch { }
+                        });
+                    }
+                }
+
+                if (routeFeatures.Count > 0)
+                {
+                    var routeLayer = new Mapsui.Layers.MemoryLayer
+                    {
+                        Name = "Camera2DRouteLayer",
+                        Features = routeFeatures
+                    };
+                    currentMap.Layers.Add(routeLayer);
+                }
+
+                if (markerFeatures.Count > 0)
+                {
+                    var markersLayer = new Mapsui.Layers.MemoryLayer
+                    {
+                        Name = "Camera2DMarkersLayer",
+                        Features = markerFeatures
+                    };
+                    currentMap.Layers.Add(markersLayer);
+                }
+
+                var (cx, cy) = Mapsui.Projections.SphericalMercator.FromLonLat(centerLon, centerLat);
+                currentMap.Navigator.CenterOnAndZoomTo(new MPoint(cx, cy), 34);
+                currentMap.Refresh();
+                CameraMapControl.Refresh();
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"InitializeOrRefresh2DCameraMap error: {ex.Message}");
+            }
+        }
+
+        private static Mapsui.Layers.MemoryLayer? cachedGeoJsonRoadsLayer;
+
+        private async Task EnsureCamera2DGeoJsonLoadedAsync(Mapsui.Map map)
+        {
+            try
+            {
+                if (map.Layers.Any(l => l.Name == "Camera2DRoadsLayer")) return;
+
+                // Ensure base OpenStreetMap tile layer is present underneath GeoJSON road network with compliant User-Agent
+                if (!map.Layers.Any(l => l.Name == "Camera2DOpenStreetMap"))
+                {
+                    var tileLayer = Mapsui.Tiling.OpenStreetMap.CreateTileLayer("RescuAR-Mobile-Evacuation-App/1.0 (contact@rescuar.app)");
+                    tileLayer.Name = "Camera2DOpenStreetMap";
+                    map.Layers.Insert(0, tileLayer);
+                }
+
+                if (cachedGeoJsonRoadsLayer != null)
+                {
+                    map.Layers.Add(cachedGeoJsonRoadsLayer);
+                    map.Refresh();
+                    return;
+                }
+
+                // Load cleaned pedestrian road graph built from RescuAR/Navigation/Data/Resources/ROADS.geojson
+                var roadGraph = await NavigationDataBootstrap.GetRoadGraphAsync();
+                if (roadGraph != null && roadGraph.Edges.Count > 0)
+                {
+                    var roadFeatures = await Task.Run(() =>
+                    {
+                        var features = new System.Collections.Generic.List<Mapsui.Nts.GeometryFeature>();
+                        var drawnPairs = new System.Collections.Generic.HashSet<long>();
+
+                        foreach (var edge in roadGraph.Edges)
+                        {
+                            if (edge.From == null || edge.To == null) continue;
+                            long pairKey = ((long)Math.Min(edge.From.Id, edge.To.Id) << 32) | (uint)Math.Max(edge.From.Id, edge.To.Id);
+                            if (!drawnPairs.Add(pairKey)) continue;
+
+                            var (x1, y1) = Mapsui.Projections.SphericalMercator.FromLonLat(edge.From.Coordinate.Longitude, edge.From.Coordinate.Latitude);
+                            var (x2, y2) = Mapsui.Projections.SphericalMercator.FromLonLat(edge.To.Coordinate.Longitude, edge.To.Coordinate.Latitude);
+
+                            var line = new NetTopologySuite.Geometries.LineString(new[]
+                            {
+                                new NetTopologySuite.Geometries.Coordinate(x1, y1),
+                                new NetTopologySuite.Geometries.Coordinate(x2, y2)
+                            });
+
+                            var feat = new Mapsui.Nts.GeometryFeature(line);
+                            features.Add(feat);
+                        }
+
+                        return features;
+                    });
+
+                    var roadLayer = new Mapsui.Layers.MemoryLayer
+                    {
+                        Name = "Camera2DRoadsLayer",
+                        Features = roadFeatures,
+                        Style = new Mapsui.Styles.VectorStyle
+                        {
+                            Line = new Mapsui.Styles.Pen
+                            {
+                                Color = new Mapsui.Styles.Color(71, 85, 105, 230), // Slate Gray Street Network #475569
+                                Width = 2.2
+                            }
+                        }
+                    };
+
+                    cachedGeoJsonRoadsLayer = roadLayer;
+                    map.Layers.Add(roadLayer);
+                    map.Refresh();
+                }
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"Error loading GeoJSON roads: {ex.Message}");
+            }
+        }
+
+        #region Voice Guidance & Route Directions Fallback
+
+        private async Task SpeakTurnInstructionAsync(string text)
+        {
+            try
+            {
+                _ttsCancellation?.Cancel();
+                _ttsCancellation?.Dispose();
+                _ttsCancellation = new CancellationTokenSource();
+                await TextToSpeech.Default.SpeakAsync(text, cancelToken: _ttsCancellation.Token);
             }
             catch { }
         }
 
+        private void OnVoiceGuidanceToggleClicked(object? sender, EventArgs e)
+        {
+            _isVoiceMuted = !_isVoiceMuted;
+            if (cameraVoiceGuidanceIcon != null)
+            {
+                cameraVoiceGuidanceIcon.Source = _isVoiceMuted ? "lucide_volume_x_black.png" : "lucide_volume_2_black.png";
+            }
+
+            if (_isVoiceMuted)
+            {
+                try
+                {
+                    _ttsCancellation?.Cancel();
+                }
+                catch { }
+            }
+            else if (!string.IsNullOrWhiteSpace(_lastSpokenInstruction))
+            {
+                _ = SpeakTurnInstructionAsync(_lastSpokenInstruction);
+            }
+        }
+
+        private void OnTurnGuidancePanelClicked(object? sender, EventArgs e)
+        {
+            OpenRouteDirectionsSheet();
+        }
+
+        private void OnRouteDirectionsCloseClicked(object? sender, EventArgs e)
+        {
+            if (routeDirectionsSheet != null)
+            {
+                routeDirectionsSheet.IsVisible = false;
+            }
+        }
+
+        private void OpenRouteDirectionsSheet()
+        {
+            PopulateRouteDirectionsSheet();
+            if (routeDirectionsSheet != null)
+            {
+                routeDirectionsSheet.IsVisible = true;
+            }
+        }
+
+        private void PopulateRouteDirectionsSheet()
+        {
+            try
+            {
+                var route = activeRoute;
+                if (route == null || route.Points == null || route.Points.Count < 2)
+                {
+                    if (routeDirectionsTargetLabel != null)
+                        routeDirectionsTargetLabel.Text = !string.IsNullOrWhiteSpace(activeDestinationName) ? $"Target: {activeDestinationName}" : "Target: Evacuation Center";
+                    if (routeDirectionsDistanceLabel != null)
+                        routeDirectionsDistanceLabel.Text = "No active route";
+                    if (routeStepsCollectionView != null)
+                        routeStepsCollectionView.ItemsSource = new System.Collections.Generic.List<RouteDirectionStepItem>
+                        {
+                            new RouteDirectionStepItem
+                            {
+                                InstructionText = "No route calculated yet",
+                                SubtitleText = "Select a safe zone to view step-by-step directions.",
+                                DistanceText = "",
+                                IconSource = "lucide_arrow_up_teal.png"
+                            }
+                        };
+                    return;
+                }
+
+                if (routeDirectionsTargetLabel != null)
+                    routeDirectionsTargetLabel.Text = !string.IsNullOrWhiteSpace(activeDestinationName) ? $"Target: {activeDestinationName}" : "Target: Safe Zone";
+
+                if (routeDirectionsDistanceLabel != null)
+                    routeDirectionsDistanceLabel.Text = $"{route.TotalDistanceMeters:F0} m total";
+
+                var steps = new System.Collections.Generic.List<RouteDirectionStepItem>();
+                var points = route.Points;
+
+                for (int i = 0; i < points.Count - 1; i++)
+                {
+                    var p1 = points[i];
+                    var p2 = points[i + 1];
+                    double segDist = p1.Coordinate.DistanceTo(p2.Coordinate);
+
+                    if (i == 0)
+                    {
+                        steps.Add(new RouteDirectionStepItem
+                        {
+                            InstructionText = "Start route from current location",
+                            SubtitleText = "Head forward along pedestrian path",
+                            DistanceText = $"{segDist:F0} m",
+                            IconSource = "lucide_arrow_up_teal.png",
+                            BackgroundColor = Color.FromArgb("#E6F4F2")
+                        });
+                    }
+                    else if (i == points.Count - 2)
+                    {
+                        steps.Add(new RouteDirectionStepItem
+                        {
+                            InstructionText = $"Arrive at {(!string.IsNullOrWhiteSpace(activeDestinationName) ? activeDestinationName : "Evacuation Center")}",
+                            SubtitleText = "Destination on designated safe zone",
+                            DistanceText = $"{segDist:F0} m",
+                            IconSource = "lucide_circle_check_big_teal.png",
+                            BackgroundColor = Color.FromArgb("#DCFCE7")
+                        });
+                    }
+                    else
+                    {
+                        var p0 = points[i - 1];
+                        double b1 = CalculateInitialBearingDegrees(p0.Coordinate, p1.Coordinate);
+                        double b2 = CalculateInitialBearingDegrees(p1.Coordinate, p2.Coordinate);
+                        double angle = NormalizeSignedDegrees(b2 - b1);
+
+                        if (Math.Abs(angle) >= 20.0 || segDist > 100.0)
+                        {
+                            string instr;
+                            string icon;
+                            if (angle < -45)
+                            {
+                                instr = "Turn left";
+                                icon = "lucide_corner_up_left_teal.png";
+                            }
+                            else if (angle < -15)
+                            {
+                                instr = "Bear left";
+                                icon = "lucide_arrow_up_left_teal.png";
+                            }
+                            else if (angle > 45)
+                            {
+                                instr = "Turn right";
+                                icon = "lucide_corner_up_right_teal.png";
+                            }
+                            else if (angle > 15)
+                            {
+                                instr = "Bear right";
+                                icon = "lucide_arrow_up_right_teal.png";
+                            }
+                            else
+                            {
+                                instr = "Continue straight";
+                                icon = "lucide_arrow_up_teal.png";
+                            }
+
+                            steps.Add(new RouteDirectionStepItem
+                            {
+                                InstructionText = instr,
+                                SubtitleText = $"Follow road corridor for {segDist:F0} m",
+                                DistanceText = $"{segDist:F0} m",
+                                IconSource = icon,
+                                BackgroundColor = Color.FromArgb("#E6F4F2")
+                            });
+                        }
+                    }
+                }
+
+                if (steps.Count == 0)
+                {
+                    steps.Add(new RouteDirectionStepItem
+                    {
+                        InstructionText = "Proceed straight to safe zone",
+                        SubtitleText = $"{route.TotalDistanceMeters:F0} m remaining",
+                        DistanceText = $"{route.TotalDistanceMeters:F0} m",
+                        IconSource = "lucide_arrow_up_teal.png"
+                    });
+                }
+
+                if (routeStepsCollectionView != null)
+                {
+                    routeStepsCollectionView.ItemsSource = steps;
+                }
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"PopulateRouteDirectionsSheet error: {ex.Message}");
+            }
+        }
+
+        #endregion
+
         #endregion
     }
+
+    public class RouteDirectionStepItem
+    {
+        public string InstructionText { get; set; } = string.Empty;
+        public string SubtitleText { get; set; } = string.Empty;
+        public string DistanceText { get; set; } = string.Empty;
+        public string IconSource { get; set; } = "lucide_arrow_up_teal.png";
+        public Color BackgroundColor { get; set; } = Color.FromArgb("#E6F4F2");
+    }
 }
+

@@ -44,6 +44,7 @@ public partial class MapViewModel : ObservableObject
             {
                 CRS = "EPSG:3857"
             };
+            map.Widgets.Clear();
 
             // Add Google Maps Base Layer
             var tileSource = new BruTile.Web.HttpTileSource(new BruTile.Predefined.GlobalSphericalMercator(0, 18), "https://mt1.google.com/vt/lyrs=m&x={x}&y={y}&z={z}", name: "Google Maps");

@@ -1,55 +1,72 @@
 using System;
 using System.ComponentModel;
+using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
 using System.Windows.Input;
+using CommunityToolkit.Mvvm.ComponentModel;
+using CommunityToolkit.Mvvm.Input;
 using Microsoft.Maui.ApplicationModel;
+using Microsoft.Maui.Controls;
 
-namespace RescuAR.App.ViewModels.Profile
+namespace RescuAR.App.ViewModels.Profile;
+
+public partial class SystemInformationViewModel : ObservableObject
 {
-    internal class SystemInformationViewModel : INotifyPropertyChanged
+    [ObservableProperty]
+    private string _cameraPermission = "Checking...";
+
+    [ObservableProperty]
+    private string _locationPermission = "Checking...";
+
+    [ObservableProperty]
+    private string _motionPermission = "Checking...";
+
+    [ObservableProperty]
+    private string _notificationsPermission = "Checking...";
+
+    public string AppVersion
     {
-        public event PropertyChangedEventHandler PropertyChanged;
-
-        private string _cameraPermission = "Unknown";
-        public string CameraPermission
+        get
         {
-            get => _cameraPermission;
-            set { _cameraPermission = value; OnPropertyChanged(); }
+            try
+            {
+                var v = AppInfo.Current.VersionString;
+                return string.IsNullOrWhiteSpace(v) ? "v1.0.0" : $"v{v}";
+            }
+            catch
+            {
+                return "v1.0.0";
+            }
         }
+    }
 
-        private string _locationPermission = "Unknown";
-        public string LocationPermission
+    public string LastUpdated
+    {
+        get
         {
-            get => _locationPermission;
-            set { _locationPermission = value; OnPropertyChanged(); }
+            try
+            {
+                var dir = AppContext.BaseDirectory;
+                if (!string.IsNullOrWhiteSpace(dir) && System.IO.Directory.Exists(dir))
+                {
+                    return System.IO.Directory.GetLastWriteTime(dir).ToString("MM/dd/yyyy hh:mm tt");
+                }
+            }
+            catch { }
+            return DateTime.Now.ToString("MM/dd/yyyy hh:mm tt");
         }
+    }
 
-        private string _motionPermission = "Unknown";
-        public string MotionPermission
-        {
-            get => _motionPermission;
-            set { _motionPermission = value; OnPropertyChanged(); }
-        }
 
-        private string _notificationsPermission = "Unknown";
-        public string NotificationsPermission
-        {
-            get => _notificationsPermission;
-            set { _notificationsPermission = value; OnPropertyChanged(); }
-        }
+    public SystemInformationViewModel()
+    {
+        _ = LoadPermissionsAsync();
+    }
 
-        public string AppVersion => AppInfo.Current.VersionString;
-        public string LastUpdated => System.IO.File.GetLastWriteTime(System.Reflection.Assembly.GetExecutingAssembly().Location).ToString("MM/dd/yyyy hh:mm tt");
-
-        public ICommand ManagePermissionsCommand { get; }
-
-        public SystemInformationViewModel()
-        {
-            ManagePermissionsCommand = new Command(() => AppInfo.ShowSettingsUI());
-        }
-
-        public async Task LoadPermissionsAsync()
+    public async Task LoadPermissionsAsync()
+    {
+        try
         {
             var camera = await Permissions.CheckStatusAsync<Permissions.Camera>();
             CameraPermission = camera == PermissionStatus.Granted ? "Allowed" : "Denied";
@@ -68,16 +85,35 @@ namespace RescuAR.App.ViewModels.Profile
             }
             else
             {
-                NotificationsPermission = "Allowed"; // Below 33 is implicitly allowed
+                NotificationsPermission = "Allowed";
             }
 #else
             NotificationsPermission = "Allowed";
 #endif
         }
-
-        protected void OnPropertyChanged([CallerMemberName] string propertyName = null)
+        catch (Exception ex)
         {
-            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
+            System.Diagnostics.Debug.WriteLine($"Error checking permissions: {ex.Message}");
+        }
+    }
+
+    [RelayCommand]
+    private void ManagePermissions()
+    {
+        try
+        {
+            AppInfo.ShowSettingsUI();
+        }
+        catch { }
+    }
+
+    [RelayCommand]
+    private async Task BackAsync()
+    {
+        if (Shell.Current != null)
+        {
+            await Shell.Current.GoToAsync("..");
         }
     }
 }
+

@@ -102,6 +102,14 @@ namespace RescuAR.App.Views.Profile
             }
         }
 
+        private async void OnBackTapped(object sender, System.EventArgs e)
+        {
+            if (Shell.Current != null)
+            {
+                await Shell.Current.GoToAsync("..");
+            }
+        }
+
         private void FinishTutorial()
         {
             IsTutorialVisible = false;
@@ -109,3 +117,4 @@ namespace RescuAR.App.Views.Profile
         }
     }
 }
+

@@ -30,7 +30,26 @@ namespace RescuAR.App.ViewModels.Authentication
 
         public async Task InitializeAsync()
         {
-            await Task.Delay(2000);
+            try
+            {
+                StatusText = "Connecting to disaster telemetry...";
+                var client = await RescuAR.Services.SupabaseService.Instance.GetClientAsync();
+                if (client?.Auth.CurrentUser != null)
+                {
+                    Preferences.Default.Set("current_user_id", client.Auth.CurrentUser.Id);
+                    if (!string.IsNullOrWhiteSpace(client.Auth.CurrentUser.Email))
+                    {
+                        Preferences.Default.Set("UserEmail", client.Auth.CurrentUser.Email);
+                    }
+                }
+            }
+            catch { }
+
+            StatusText = "Loading offline evacuation maps...";
+            await Task.Delay(1200);
+
+            StatusText = "Starting safety system...";
+            await Task.Delay(400);
 
             bool isLoggedIn = Preferences.Default.Get("IsLoggedIn", false);
             bool hasSignedUp = Preferences.Default.Get("HasSignedUp", false);

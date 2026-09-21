@@ -78,8 +78,19 @@ namespace RescuAR.App.ViewModels.Authentication
                     }
                 }
 
+                var clientUser = RescuAR.Services.SupabaseService.Instance.Client?.Auth.CurrentUser;
+                if (!string.IsNullOrEmpty(clientUser?.Id))
+                {
+                    Preferences.Default.Set("current_user_id", clientUser.Id);
+                }
+                else if (string.IsNullOrEmpty(Preferences.Default.Get("current_user_id", "")))
+                {
+                    Preferences.Default.Set("current_user_id", $"google_{email.GetHashCode()}");
+                }
+
                 Preferences.Default.Set("UserFirstName", firstName);
                 Preferences.Default.Set("UserLastName", lastName);
+                Preferences.Default.Set("UserEmail", email);
 
                 MainThread.BeginInvokeOnMainThread(() =>
                 {
@@ -122,7 +133,15 @@ namespace RescuAR.App.ViewModels.Authentication
             try
             {
                 // Trigger the actual Supabase OAuth Google authentication flow (with browser + 2FA)
-                await _authService.SignInWithGoogleAsync();
+                var session = await _authService.SignInWithGoogleAsync();
+                if (!string.IsNullOrEmpty(session.User?.Id))
+                {
+                    Preferences.Default.Set("current_user_id", session.User.Id);
+                    if (!string.IsNullOrEmpty(session.User.Email))
+                    {
+                        Preferences.Default.Set("UserEmail", session.User.Email);
+                    }
+                }
 
                 // Navigate to Permissions or Dashboard upon success
                 MainThread.BeginInvokeOnMainThread(() =>

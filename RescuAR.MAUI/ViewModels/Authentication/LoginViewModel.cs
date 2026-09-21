@@ -24,6 +24,9 @@ namespace RescuAR.App.ViewModels.Authentication
         private string _password = string.Empty;
 
         [ObservableProperty]
+        private bool _isRememberMe = true;
+
+        [ObservableProperty]
         private bool _isPasswordVisible = false;
 
         [ObservableProperty]
@@ -43,6 +46,47 @@ namespace RescuAR.App.ViewModels.Authentication
 
         public bool IsPasswordHidden => !IsPasswordVisible;
 
+        // --- Password Reset In-App Flow Properties ---
+        [ObservableProperty]
+        private bool _isResetPasswordModalVisible;
+
+        [ObservableProperty]
+        private int _resetStep = 1; // 1 = Enter email, 2 = Enter code & new password
+
+        [ObservableProperty]
+        private string _resetEmail = string.Empty;
+
+        [ObservableProperty]
+        private string _resetOtpCode = string.Empty;
+
+        [ObservableProperty]
+        private string _resetNewPassword = string.Empty;
+
+        [ObservableProperty]
+        private string _resetConfirmPassword = string.Empty;
+
+        [ObservableProperty]
+        private string _resetErrorMessage = string.Empty;
+
+        [ObservableProperty]
+        private bool _isResetLoading;
+
+        [ObservableProperty]
+        private bool _isResetSuccess;
+
+        public bool HasResetError => !string.IsNullOrWhiteSpace(ResetErrorMessage);
+        public bool IsResetNotLoading => !IsResetLoading;
+
+        partial void OnIsResetLoadingChanged(bool value)
+        {
+            OnPropertyChanged(nameof(IsResetNotLoading));
+        }
+
+        partial void OnResetErrorMessageChanged(string value)
+        {
+            OnPropertyChanged(nameof(HasResetError));
+        }
+
         // SVG Paths for Eye and Eye-Off
         private const string EyeIcon = "M12,9A3,3 0 0,0 9,12A3,3 0 0,0 12,15A3,3 0 0,0 15,12A3,3 0 0,0 12,9M12,17C8.13,17 4.79,14.65 3.32,11.5C4.79,8.35 8.13,6 12,6C15.87,6 19.21,8.35 20.68,11.5C19.21,14.65 15.87,17 12,17M12,4.5C7,4.5 2.73,7.61 1,11.5C2.73,15.39 7,18.5 12,18.5C17,18.5 21.27,15.39 23,11.5C21.27,7.61 17,4.5 12,4.5Z";
         private const string EyeOffIcon = "M11.83,9L15,12.16C15,12.11 15,12.05 15,12A3,3 0 0,0 12,9C11.94,9 11.89,9 11.83,9M7.53,9.8L9.08,11.35C9.03,11.54 9,11.76 9,12A3,3 0 0,0 12,15C12.24,15 12.46,14.97 12.65,14.92L14.2,16.47C13.53,16.8 12.79,17 12,17C8.13,17 4.79,14.65 3.32,11.5C4.38,9.45 6.09,7.9 8.15,7.03L7.53,9.8M2,4.27L4.28,6.55L4.73,7C3.08,8.3 1.78,10 1,11.5C2.73,15.39 7,18.5 12,18.5C13.84,18.5 15.58,18.11 17.15,17.43L17.59,17.87L19.73,20L21,18.73L3.27,3L2,4.27M12,4.5C17,4.5 21.27,7.61 23,11.5C22.25,13 21.14,14.33 19.8,15.34L18.42,13.96C19.46,13.1 20.25,12 20.68,11.5C19.21,8.35 15.87,6 12,6C11.12,6 10.26,6.15 9.46,6.43L8.09,5.06C9.28,4.7 10.6,4.5 12,4.5Z";
@@ -59,6 +103,22 @@ namespace RescuAR.App.ViewModels.Authentication
         {
             _serviceProvider = serviceProvider;
             _authService = authService;
+
+            try
+            {
+                _isRememberMe = Preferences.Default.Get("RememberMe", true);
+                if (_isRememberMe)
+                {
+                    _email = Preferences.Default.Get("SavedLoginEmail", string.Empty);
+                }
+            }
+            catch { }
+        }
+
+        [RelayCommand]
+        private void ToggleRememberMe()
+        {
+            IsRememberMe = !IsRememberMe;
         }
 
         [RelayCommand]
@@ -98,6 +158,22 @@ namespace RescuAR.App.ViewModels.Authentication
                 // Save session preference
                 Preferences.Default.Set("IsLoggedIn", true);
                 Preferences.Default.Set("UserEmail", Email.Trim());
+
+                if (IsRememberMe)
+                {
+                    Preferences.Default.Set("RememberMe", true);
+                    Preferences.Default.Set("SavedLoginEmail", Email.Trim());
+                }
+                else
+                {
+                    Preferences.Default.Set("RememberMe", false);
+                    Preferences.Default.Remove("SavedLoginEmail");
+                }
+
+                if (!string.IsNullOrEmpty(session.User?.Id))
+                {
+                    Preferences.Default.Set("current_user_id", session.User.Id);
+                }
 
                 // Ensure user profile row exists in users table with first_name and last_name
                 _ = Task.Run(async () =>
@@ -221,11 +297,113 @@ namespace RescuAR.App.ViewModels.Authentication
         }
 
         [RelayCommand]
-        private async Task ResetPassword()
+        private void OpenResetPasswordModal()
         {
-            if (AuthenticationNavigation.RootPage != null)
+            ResetEmail = !string.IsNullOrWhiteSpace(Email) ? Email.Trim() : string.Empty;
+            ResetOtpCode = string.Empty;
+            ResetNewPassword = string.Empty;
+            ResetConfirmPassword = string.Empty;
+            ResetErrorMessage = string.Empty;
+            ResetStep = 1;
+            IsResetSuccess = false;
+            IsResetPasswordModalVisible = true;
+        }
+
+        [RelayCommand]
+        private void CloseResetPasswordModal()
+        {
+            IsResetPasswordModalVisible = false;
+            IsResetSuccess = false;
+        }
+
+        [RelayCommand]
+        private async Task SendResetOtp()
+        {
+            if (IsResetLoading) return;
+
+            ResetErrorMessage = string.Empty;
+            if (string.IsNullOrWhiteSpace(ResetEmail) || !ResetEmail.Contains("@"))
             {
-                await AuthenticationNavigation.RootPage!.DisplayAlert("Reset Password", "Password reset instructions have been sent to your email.", "OK");
+                ResetErrorMessage = "Please enter a valid email address.";
+                return;
+            }
+
+            IsResetLoading = true;
+            try
+            {
+                var client = RescuAR.Services.SupabaseService.Instance.Client;
+                if (client != null)
+                {
+                    await client.Auth.ResetPasswordForEmail(ResetEmail.Trim());
+                }
+                ResetStep = 2;
+            }
+            catch (Exception ex)
+            {
+                ResetErrorMessage = ex.Message ?? "Failed to send reset code. Please check your email address.";
+            }
+            finally
+            {
+                IsResetLoading = false;
+            }
+        }
+
+        [RelayCommand]
+        private async Task ConfirmResetPassword()
+        {
+            if (IsResetLoading) return;
+
+            ResetErrorMessage = string.Empty;
+
+            if (string.IsNullOrWhiteSpace(ResetOtpCode) || ResetOtpCode.Trim().Length < 6)
+            {
+                ResetErrorMessage = "Please enter the 6-digit recovery code sent to your email.";
+                return;
+            }
+
+            if (string.IsNullOrWhiteSpace(ResetNewPassword) || ResetNewPassword.Length < 6)
+            {
+                ResetErrorMessage = "New password must be at least 6 characters long.";
+                return;
+            }
+
+            if (ResetNewPassword != ResetConfirmPassword)
+            {
+                ResetErrorMessage = "Passwords do not match.";
+                return;
+            }
+
+            IsResetLoading = true;
+            try
+            {
+                var client = RescuAR.Services.SupabaseService.Instance.Client;
+                if (client != null)
+                {
+                    // 1. Verify recovery OTP
+                    var session = await client.Auth.VerifyOTP(ResetEmail.Trim(), ResetOtpCode.Trim(), Supabase.Gotrue.Constants.EmailOtpType.Recovery);
+                    if (session?.User != null)
+                    {
+                        // 2. Update user password
+                        var attrs = new Supabase.Gotrue.UserAttributes
+                        {
+                            Password = ResetNewPassword
+                        };
+                        await client.Auth.Update(attrs);
+                        IsResetSuccess = true;
+                    }
+                    else
+                    {
+                        ResetErrorMessage = "Invalid recovery code. Please check your email and try again.";
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                ResetErrorMessage = ex.Message ?? "Failed to reset password. Please check your code.";
+            }
+            finally
+            {
+                IsResetLoading = false;
             }
         }
     }

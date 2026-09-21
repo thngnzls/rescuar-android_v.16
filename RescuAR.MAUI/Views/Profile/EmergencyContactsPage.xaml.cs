@@ -5,10 +5,11 @@ namespace RescuAR.App.Views.Profile
 {
     public partial class EmergencyContactsPage : ContentPage
     {
-        public EmergencyContactsPage()
+        public EmergencyContactsPage(EmergencyContactsViewModel? viewModel = null)
         {
             InitializeComponent();
-            BindingContext = new ProfileViewModel();
+            BindingContext = viewModel ?? new EmergencyContactsViewModel();
         }
     }
 }
+

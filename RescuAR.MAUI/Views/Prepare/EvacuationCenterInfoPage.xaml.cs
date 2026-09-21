@@ -40,9 +40,10 @@ namespace RescuAR.App.Views.Prepare
                 {
                     CRS = "EPSG:3857"
                 };
+                map.Widgets.Clear();
 
-                // Add OpenStreetMap (OSM) Base Layer
-                var osmLayer = Mapsui.Tiling.OpenStreetMap.CreateTileLayer();
+                // Add OpenStreetMap (OSM) Base Layer with compliant User-Agent
+                var osmLayer = Mapsui.Tiling.OpenStreetMap.CreateTileLayer("RescuAR-Mobile-Evacuation-App/1.0 (contact@rescuar.app)");
                 map.Layers.Add(osmLayer);
 
                 // Project shelter center coordinates (SphericalMercator)

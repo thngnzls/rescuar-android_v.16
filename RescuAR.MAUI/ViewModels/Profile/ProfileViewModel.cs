@@ -100,6 +100,16 @@ namespace RescuAR.App.ViewModels.Profile
                         CurrentUser = user;
                     }
                     
+                    // Check local preferences if AvatarUrl was not yet in DB
+                    if (string.IsNullOrWhiteSpace(CurrentUser.AvatarUrl))
+                    {
+                        var localAvatar = Preferences.Default.Get("UserAvatarUrl", string.Empty);
+                        if (!string.IsNullOrWhiteSpace(localAvatar) && File.Exists(localAvatar))
+                        {
+                            CurrentUser.AvatarUrl = localAvatar;
+                        }
+                    }
+
                     // Explicitly update Observable properties for reliable MAUI binding
                     if (!string.IsNullOrWhiteSpace(CurrentUser.Username))
                     {
@@ -115,6 +125,23 @@ namespace RescuAR.App.ViewModels.Profile
                     var temp = CurrentUser;
                     CurrentUser = new User();
                     CurrentUser = temp;
+                }
+                else
+                {
+                    // Offline / cached preference fallback
+                    var localAvatar = Preferences.Default.Get("UserAvatarUrl", string.Empty);
+                    if (!string.IsNullOrWhiteSpace(localAvatar))
+                    {
+                        AvatarUrl = localAvatar;
+                        CurrentUser.AvatarUrl = localAvatar;
+                    }
+                    var cachedEmail = Preferences.Default.Get("UserEmail", string.Empty);
+                    var cachedFn = Preferences.Default.Get("UserFirstName", "RescuAR");
+                    var cachedLn = Preferences.Default.Get("UserLastName", "User");
+                    CurrentUser.Email = cachedEmail;
+                    CurrentUser.FirstName = cachedFn;
+                    CurrentUser.LastName = cachedLn;
+                    FullName = $"{cachedFn} {cachedLn}".Trim();
                 }
             }
             catch (Exception ex)
@@ -161,62 +188,69 @@ namespace RescuAR.App.ViewModels.Profile
 
                 if (result != null)
                 {
-                    bool confirm = await Shell.Current.DisplayAlert("Confirm Upload", "Do you want to use this image as your profile picture?", "Yes", "No");
+                    bool confirm = await Shell.Current.DisplayAlert("Confirm Profile Picture", "Do you want to use this image as your profile picture?", "Yes", "No");
                     if (!confirm) return;
 
+                    var stream = await result.OpenReadAsync();
+                    using var memoryStream = new MemoryStream();
+                    await stream.CopyToAsync(memoryStream);
+                    var bytes = memoryStream.ToArray();
+
                     var client = RescuAR.Services.SupabaseService.Instance.Client;
+                    var currentUserId = client?.Auth.CurrentUser?.Id 
+                        ?? client?.Auth.CurrentSession?.User?.Id 
+                        ?? Preferences.Default.Get("current_user_id", "user");
+
+                    var fileName = $"avatar_{currentUserId}_{DateTime.UtcNow.Ticks}.jpg";
+                    var localPath = Path.Combine(FileSystem.AppDataDirectory, fileName);
+                    File.WriteAllBytes(localPath, bytes);
+
+                    // Always persist local avatar path in preferences for instant offline retrieval & map rendering
+                    Preferences.Default.Set("UserAvatarUrl", localPath);
+                    Preferences.Default.Set("UserProfilePicPath", localPath);
+
+                    AvatarUrl = localPath;
+                    CurrentUser.AvatarUrl = localPath;
+
+                    // Re-trigger MAUI bindings
+                    var tempUser = CurrentUser;
+                    CurrentUser = new User();
+                    CurrentUser = tempUser;
+
+                    // Try to upload to Supabase Storage and sync user row
                     if (client != null && client.Auth.CurrentSession != null)
                     {
-                        var stream = await result.OpenReadAsync();
-                        using var memoryStream = new MemoryStream();
-                        await stream.CopyToAsync(memoryStream);
-                        var bytes = memoryStream.ToArray();
-
-                        var currentUserId = client.Auth.CurrentSession.User?.Id;
-                        if (string.IsNullOrWhiteSpace(currentUserId))
-                        {
-                            throw new InvalidOperationException("The authenticated Supabase user is unavailable.");
-                        }
-
-                        var fileName = $"{currentUserId}-{Guid.NewGuid()}.jpg";
-                        
-                        // Save locally first so the UI works even if Supabase Storage fails
-                        var localPath = Path.Combine(FileSystem.AppDataDirectory, fileName);
-                        File.WriteAllBytes(localPath, bytes);
-                        
-                        AvatarUrl = localPath;
-                        CurrentUser.AvatarUrl = localPath;
-                        
                         try
                         {
                             await client.Storage.From("avatars").Upload(bytes, fileName, new Supabase.Storage.FileOptions { Upsert = true });
                             var publicUrl = client.Storage.From("avatars").GetPublicUrl(fileName);
-                            AvatarUrl = publicUrl;
-                            CurrentUser.AvatarUrl = publicUrl;
+                            if (!string.IsNullOrWhiteSpace(publicUrl))
+                            {
+                                AvatarUrl = publicUrl;
+                                CurrentUser.AvatarUrl = publicUrl;
+                                Preferences.Default.Set("UserAvatarPublicUrl", publicUrl);
+                            }
                         }
                         catch (Exception ex)
                         {
-                            Console.WriteLine($"Supabase storage upload failed, using local cache: {ex.Message}");
+                            Console.WriteLine($"Supabase storage upload error: {ex.Message}");
                         }
-                        
-                        // Re-trigger bindings
-                        var tempUser = CurrentUser;
-                        CurrentUser = new User();
-                        CurrentUser = tempUser;
-                        
-                        // Try to save to DB
-                        try {
+
+                        try
+                        {
                             await client.From<User>().Upsert(CurrentUser);
-                            await Shell.Current.DisplayAlert("Success", "Profile picture updated successfully!", "OK");
-                        } catch { }
+                        }
+                        catch { }
                     }
+
+                    await Shell.Current.DisplayAlert("Success", "Profile picture updated successfully!", "OK");
                 }
             }
             catch (Exception ex)
             {
                 if (Shell.Current != null)
                 {
-                    await Shell.Current.DisplayAlert("Error", $"Could not update avatar: {ex.Message}", "OK");
+                    await Shell.Current.DisplayAlert("Error", $"Could not update profile picture: {ex.Message}", "OK");
                 }
             }
         }

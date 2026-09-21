@@ -20,16 +20,16 @@ namespace RescuAR.App.Models
         public DateTime CreatedAt { get; set; }
 
         [Column("created_by")]
-        public string CreatedBy { get; set; } = string.Empty;
+        public string? CreatedBy { get; set; }
     }
 
     [Table("safety_circle_members")]
     public class SupabaseCircleMember : BaseModel
     {
-        [PrimaryKey("circle_id", true)]
+        [PrimaryKey("circle_id", false)]
         public string CircleId { get; set; } = string.Empty;
 
-        [PrimaryKey("user_id", true)]
+        [PrimaryKey("user_id", false)]
         public string UserId { get; set; } = string.Empty;
 
         [Column("joined_at")]
@@ -39,7 +39,7 @@ namespace RescuAR.App.Models
     [Table("user_locations")]
     public class SupabaseUserLocation : BaseModel
     {
-        [PrimaryKey("user_id", true)]
+        [PrimaryKey("user_id", false)]
         public string UserId { get; set; } = string.Empty;
 
         [Column("latitude")]
@@ -97,6 +97,37 @@ namespace RescuAR.App.Models
 
         [Column("media_type")]
         public string MediaType { get; set; } = "Text"; // Text, Image, Video
+
+        [Column("created_at")]
+        public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+    }
+
+    [Table("circle_messages")]
+    public class SupabaseCircleMessageAlt : BaseModel
+    {
+        [PrimaryKey("id", false)]
+        public string Id { get; set; } = Guid.NewGuid().ToString();
+
+        [Column("circle_id")]
+        public string CircleId { get; set; } = string.Empty;
+
+        [Column("user_id")]
+        public string UserId { get; set; } = string.Empty;
+
+        [Column("sender_name")]
+        public string SenderName { get; set; } = string.Empty;
+
+        [Column("sender_avatar_url")]
+        public string SenderAvatarUrl { get; set; } = string.Empty;
+
+        [Column("message_text")]
+        public string MessageText { get; set; } = string.Empty;
+
+        [Column("media_url")]
+        public string MediaUrl { get; set; } = string.Empty;
+
+        [Column("media_type")]
+        public string MediaType { get; set; } = "Text";
 
         [Column("created_at")]
         public DateTime CreatedAt { get; set; } = DateTime.UtcNow;

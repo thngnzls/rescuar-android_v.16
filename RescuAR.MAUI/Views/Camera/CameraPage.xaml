@@ -214,7 +214,7 @@
             <Border
                 x:Name="turnGuidancePanel"
                 IsVisible="False"
-                InputTransparent="True"
+                InputTransparent="False"
                 ZIndex="21"
                 Margin="8,48,8,0"
                 Padding="12,9"
@@ -227,6 +227,9 @@
                 <Border.Shadow>
                     <Shadow Brush="#26000000" Offset="0,2" Radius="6" Opacity="0.22" />
                 </Border.Shadow>
+                <Border.GestureRecognizers>
+                    <TapGestureRecognizer Tapped="OnTurnGuidancePanelClicked" />
+                </Border.GestureRecognizers>
                 <Grid
                     ColumnDefinitions="46,*,22"
                     ColumnSpacing="8"
@@ -423,6 +426,27 @@
                         x:Name="cameraFlashlightIcon"
                         InputTransparent="True"
                         Source="icon_flashlight.png"
+                        WidthRequest="23"
+                        HeightRequest="23"
+                        HorizontalOptions="Center"
+                        VerticalOptions="Center" />
+                </Border>
+
+                <Border
+                    x:Name="cameraVoiceGuidanceButton"
+                    WidthRequest="58"
+                    HeightRequest="58"
+                    BackgroundColor="#ECFFFFFF"
+                    Stroke="#F4FFFFFF"
+                    StrokeThickness="1"
+                    StrokeShape="RoundRectangle 7">
+                    <Border.GestureRecognizers>
+                        <TapGestureRecognizer Tapped="OnVoiceGuidanceToggleClicked" />
+                    </Border.GestureRecognizers>
+                    <Image
+                        x:Name="cameraVoiceGuidanceIcon"
+                        InputTransparent="True"
+                        Source="lucide_volume_2_black.png"
                         WidthRequest="23"
                         HeightRequest="23"
                         HorizontalOptions="Center"
@@ -716,6 +740,143 @@
                                 Clicked="OnDeveloperHazardRerouteTestClicked" />
                         </VerticalStackLayout>
                     </VerticalStackLayout>
+                </Border>
+            </Grid>
+
+            <!-- ========================================================= -->
+            <!-- ROUTE DIRECTIONS FALLBACK BOTTOM SHEET                    -->
+            <!-- ========================================================= -->
+            <Grid
+                x:Name="routeDirectionsSheet"
+                IsVisible="False"
+                ZIndex="60"
+                VerticalOptions="End">
+                <Border
+                    Padding="16,14"
+                    BackgroundColor="White"
+                    Stroke="#E5E7E9"
+                    StrokeThickness="1"
+                    StrokeShape="RoundRectangle 16">
+                    <Border.Shadow>
+                        <Shadow Brush="#30000000" Offset="0,-4" Radius="12" Opacity="0.2" />
+                    </Border.Shadow>
+                    <Grid RowDefinitions="Auto,Auto,Auto,*" RowSpacing="10" MaximumHeightRequest="440">
+                        <!-- Pull Handle -->
+                        <BoxView
+                            Grid.Row="0"
+                            WidthRequest="36"
+                            HeightRequest="4"
+                            CornerRadius="2"
+                            BackgroundColor="#D1D5DB"
+                            HorizontalOptions="Center" />
+
+                        <!-- Header -->
+                        <Grid Grid.Row="1" ColumnDefinitions="*,30">
+                            <VerticalStackLayout Spacing="2">
+                                <Label
+                                    x:Name="routeDirectionsTitleLabel"
+                                    Text="Turn-by-Turn Route Guidance"
+                                    TextColor="#111827"
+                                    FontSize="15"
+                                    FontAttributes="Bold" />
+                                <Label
+                                    x:Name="routeDirectionsSubtitleLabel"
+                                    Text="Offline Fallback Directions"
+                                    TextColor="#0A8491"
+                                    FontSize="11"
+                                    FontAttributes="Bold" />
+                            </VerticalStackLayout>
+                            <Border
+                                Grid.Column="1"
+                                WidthRequest="30"
+                                HeightRequest="30"
+                                BackgroundColor="Transparent"
+                                StrokeThickness="0">
+                                <Border.GestureRecognizers>
+                                    <TapGestureRecognizer Tapped="OnRouteDirectionsCloseClicked" />
+                                </Border.GestureRecognizers>
+                                <Image
+                                    Source="lucide_x_gray.png"
+                                    WidthRequest="16"
+                                    HeightRequest="16"
+                                    HorizontalOptions="Center"
+                                    VerticalOptions="Center" />
+                            </Border>
+                        </Grid>
+
+                        <!-- Route Stats Bar -->
+                        <Border
+                            Grid.Row="2"
+                            Padding="12,8"
+                            BackgroundColor="#F0FDFA"
+                            Stroke="#CCFBF1"
+                            StrokeThickness="1"
+                            StrokeShape="RoundRectangle 8">
+                            <Grid ColumnDefinitions="*,Auto">
+                                <Label
+                                    x:Name="routeDirectionsTargetLabel"
+                                    Text="Target: Evacuation Center"
+                                    TextColor="#0F766E"
+                                    FontSize="12"
+                                    FontAttributes="Bold"
+                                    VerticalOptions="Center" />
+                                <Label
+                                    Grid.Column="1"
+                                    x:Name="routeDirectionsDistanceLabel"
+                                    Text="0 m"
+                                    TextColor="#0F766E"
+                                    FontSize="12"
+                                    FontAttributes="Bold"
+                                    VerticalOptions="Center" />
+                            </Grid>
+                        </Border>
+
+                        <!-- Steps Collection -->
+                        <CollectionView
+                            Grid.Row="3"
+                            x:Name="routeStepsCollectionView"
+                            SelectionMode="None"
+                            Margin="0,4,0,0">
+                            <CollectionView.ItemTemplate>
+                                <DataTemplate x:DataType="camera:RouteDirectionStepItem">
+                                    <Grid ColumnDefinitions="36,*,Auto" ColumnSpacing="10" Padding="0,8">
+                                        <Border
+                                            WidthRequest="32"
+                                            HeightRequest="32"
+                                            StrokeThickness="0"
+                                            BackgroundColor="{Binding BackgroundColor}"
+                                            StrokeShape="RoundRectangle 6"
+                                            VerticalOptions="Center">
+                                            <Image
+                                                Source="{Binding IconSource}"
+                                                WidthRequest="18"
+                                                HeightRequest="18"
+                                                HorizontalOptions="Center"
+                                                VerticalOptions="Center" />
+                                        </Border>
+                                        <VerticalStackLayout Grid.Column="1" Spacing="2" VerticalOptions="Center">
+                                            <Label
+                                                Text="{Binding InstructionText}"
+                                                TextColor="#1F2937"
+                                                FontSize="13"
+                                                FontAttributes="Bold" />
+                                            <Label
+                                                Text="{Binding SubtitleText}"
+                                                TextColor="#6B7280"
+                                                FontSize="11" />
+                                        </VerticalStackLayout>
+                                        <Label
+                                            Grid.Column="2"
+                                            Text="{Binding DistanceText}"
+                                            TextColor="#0A8491"
+                                            FontSize="12"
+                                            FontAttributes="Bold"
+                                            VerticalOptions="Center" />
+                                    </Grid>
+                                </DataTemplate>
+                            </CollectionView.ItemTemplate>
+                        </CollectionView>
+                    </Grid>
                 </Border>
             </Grid>
 

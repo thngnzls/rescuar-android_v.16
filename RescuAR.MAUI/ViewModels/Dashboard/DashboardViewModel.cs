@@ -514,6 +514,10 @@ public partial class DashboardViewModel : ObservableObject
         if (item != null)
         {
             item.IsEnabled = !item.IsEnabled;
+            if (item.Id == "siren" || item.ActionType == "Siren")
+            {
+                Preferences.Default.Set("EmergencySirenEnabled", item.IsEnabled);
+            }
             SyncEnabledQuickActions();
         }
     }
@@ -545,6 +549,19 @@ public partial class DashboardViewModel : ObservableObject
         };
 
         AllAvailableQuickActions.Add(newAction);
+
+        // Sync with Profile tab emergency contacts
+        if (string.IsNullOrWhiteSpace(Preferences.Default.Get("EmergencyContact1Name", string.Empty)))
+        {
+            Preferences.Default.Set("EmergencyContact1Name", NewContactName.Trim());
+            Preferences.Default.Set("EmergencyContact1Phone", NewContactPhone.Trim());
+        }
+        else if (string.IsNullOrWhiteSpace(Preferences.Default.Get("EmergencyContact2Name", string.Empty)))
+        {
+            Preferences.Default.Set("EmergencyContact2Name", NewContactName.Trim());
+            Preferences.Default.Set("EmergencyContact2Phone", NewContactPhone.Trim());
+        }
+
         NewContactName = string.Empty;
         NewContactPhone = string.Empty;
         SyncEnabledQuickActions();

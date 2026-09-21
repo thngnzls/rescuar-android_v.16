@@ -82,6 +82,11 @@ public partial class CircleChatViewModel : ObservableObject
     [ObservableProperty]
     private string uploadStatusText = string.Empty;
 
+    [ObservableProperty]
+    private bool isCirclePickerOpen = false;
+
+    public ObservableCollection<SupabaseSafetyCircle> MyCircles { get; } = new();
+
     public ObservableCollection<ChatMessageItem> Messages { get; } = new();
 
     public CircleChatViewModel(SafetyCircleService safetyCircleService)
@@ -95,6 +100,45 @@ public partial class CircleChatViewModel : ObservableObject
             _chatTimer.Interval = TimeSpan.FromSeconds(3);
             _chatTimer.Tick += async (s, e) => await RefreshMessagesSilentAsync();
         }
+
+        _ = LoadMyCirclesListAsync();
+    }
+
+    public async Task LoadMyCirclesListAsync()
+    {
+        try
+        {
+            var list = await _safetyCircleService.GetMyCirclesAsync();
+            MyCircles.Clear();
+            foreach (var c in list)
+            {
+                MyCircles.Add(c);
+            }
+        }
+        catch { }
+    }
+
+    [RelayCommand]
+    private void ToggleCirclePicker()
+    {
+        IsCirclePickerOpen = !IsCirclePickerOpen;
+        if (IsCirclePickerOpen)
+        {
+            _ = LoadMyCirclesListAsync();
+        }
+    }
+
+    [RelayCommand]
+    private async Task SwitchCircleAsync(SupabaseSafetyCircle circle)
+    {
+        if (circle == null || circle.Id == CircleId)
+        {
+            IsCirclePickerOpen = false;
+            return;
+        }
+
+        IsCirclePickerOpen = false;
+        await InitializeWithCircleAsync(circle.Id, circle.Name);
     }
 
     private void RefreshCurrentUserId()
@@ -158,12 +202,17 @@ public partial class CircleChatViewModel : ObservableObject
                 MemberCountText = $"{members.Count} {(members.Count == 1 ? "Member" : "Members")} Online";
             }
 
-            // Load saved group photo from preferences if exists
+            // Load saved group photo from preferences if exists for this specific circle
             var savedGroupPhoto = Preferences.Default.Get($"circle_avatar_{CircleId}", string.Empty);
             if (!string.IsNullOrWhiteSpace(savedGroupPhoto))
             {
                 GroupAvatarUrl = savedGroupPhoto;
                 HasGroupAvatar = true;
+            }
+            else
+            {
+                GroupAvatarUrl = string.Empty;
+                HasGroupAvatar = false;
             }
         }
         catch { }
@@ -197,7 +246,13 @@ public partial class CircleChatViewModel : ObservableObject
         try
         {
             var rawMsgs = await _safetyCircleService.GetCircleMessagesAsync(CircleId);
-            if (rawMsgs.Count != Messages.Count)
+            bool needsUpdate = rawMsgs.Count != Messages.Count;
+            if (!needsUpdate && rawMsgs.Count > 0 && Messages.Count > 0)
+            {
+                needsUpdate = !string.Equals(rawMsgs.Last().Id, Messages.Last().Id, StringComparison.OrdinalIgnoreCase);
+            }
+
+            if (needsUpdate)
             {
                 MainThread.BeginInvokeOnMainThread(() =>
                 {
@@ -214,7 +269,7 @@ public partial class CircleChatViewModel : ObservableObject
         Messages.Clear();
         foreach (var m in rawMsgs)
         {
-            bool isMine = !string.IsNullOrEmpty(_currentUserId) ? (m.UserId == _currentUserId) : true;
+            bool isMine = !string.IsNullOrEmpty(_currentUserId) && string.Equals(m.UserId, _currentUserId, StringComparison.OrdinalIgnoreCase);
             Messages.Add(new ChatMessageItem
             {
                 Id = m.Id,
