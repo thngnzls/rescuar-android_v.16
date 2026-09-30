@@ -31,7 +31,7 @@ public static class ARRouteRenderer
         "ARRouteRoot";
 
     private const float RouteWidthMeters =
-        0.65f;
+        0.55f;
 
     private const float RouteThicknessMeters =
         0.04f;
@@ -80,6 +80,11 @@ public static class ARRouteRenderer
     private const int MaxRouteSegments =
         64;
 
+    public static int MaximumRouteSegments => MaxRouteSegments;
+
+    // Diagnostic mode either displays every local line or declines to start.
+    private const int MaxDiagnosticSegments = 512;
+
     private static readonly object sync =
         new();
 
@@ -92,6 +97,53 @@ public static class ARRouteRenderer
 
     private static SegmentSlot[] arrowSlots =
         [];
+    private static Material? segmentMaterial;
+    private static NearbyRoadLineProjector.RoadLineSegment[] diagnosticSegments = [];
+    private static RoadDiagnosticPlacement diagnosticPlacement;
+    private static long diagnosticVersion;
+    private static long appliedDiagnosticVersion = -1;
+
+    public readonly record struct RoadDiagnosticPlacement(
+        bool Active, float X, float Z, long AnchorGeneration,
+        long SessionGeneration);
+
+    public static RoadDiagnosticPlacement CurrentRoadDiagnosticPlacement
+    {
+        get { lock (sync) return diagnosticPlacement; }
+    }
+
+    public static int MaximumDiagnosticSegments => MaxDiagnosticSegments;
+
+    public static void ShowRoadDiagnostics(
+        IReadOnlyList<NearbyRoadLineProjector.RoadLineSegment> lines,
+        float worldX, float worldZ, long anchorGeneration,
+        long sessionGeneration)
+    {
+        ArgumentNullException.ThrowIfNull(lines);
+        if (lines.Count == 0 || lines.Count > MaxDiagnosticSegments ||
+            anchorGeneration <= 0 || sessionGeneration <= 0)
+            throw new ArgumentOutOfRangeException(nameof(lines));
+        var copy = new NearbyRoadLineProjector.RoadLineSegment[lines.Count];
+        for (int i = 0; i < copy.Length; i++) copy[i] = lines[i];
+        lock (sync)
+        {
+            diagnosticSegments = copy;
+            diagnosticPlacement = new RoadDiagnosticPlacement(
+                true, worldX, worldZ, anchorGeneration, sessionGeneration);
+            diagnosticVersion++;
+        }
+    }
+
+    public static void HideRoadDiagnostics()
+    {
+        lock (sync)
+        {
+            diagnosticPlacement = default;
+            diagnosticSegments = [];
+            diagnosticVersion++;
+            appliedRouteVersion = -1;
+        }
+    }
 
     private static long appliedRouteVersion =
         -1;
@@ -234,6 +286,8 @@ public static class ARRouteRenderer
 
             segmentSlots =
                 slots;
+            segmentMaterial = standardMaterial.Material;
+            appliedDiagnosticVersion = -1;
 
             arrowSlots =
                 arrows;
@@ -291,6 +345,51 @@ public static class ARRouteRenderer
                 arrowSlots;
         }
 
+        RoadDiagnosticPlacement placement;
+        NearbyRoadLineProjector.RoadLineSegment[] diagnosticLines;
+        long nextDiagnosticVersion;
+        lock (sync)
+        {
+            placement = diagnosticPlacement;
+            diagnosticLines = diagnosticSegments;
+            nextDiagnosticVersion = diagnosticVersion;
+        }
+        if (placement.Active)
+        {
+            if (appliedDiagnosticVersion != nextDiagnosticVersion)
+            {
+                if (segmentMaterial is null) return false;
+                if (slots.Length < diagnosticLines.Length)
+                {
+                    int oldCount = slots.Length;
+                    Array.Resize(ref slots, diagnosticLines.Length);
+                    for (int i = oldCount; i < slots.Length; i++)
+                    {
+                        slots[i] = CreateSegmentSlot(i, segmentMaterial);
+                        routeRoot.AddChild(slots[i].Entity);
+                    }
+                    lock (sync) segmentSlots = slots;
+                }
+                DisableAll(slots);
+                DisableAll(arrows);
+                activeSegmentCount = 0;
+                for (int i = 0; i < diagnosticLines.Length; i++)
+                    if (TryApplySegment(slots[i], diagnosticLines[i].Start,
+                            diagnosticLines[i].End)) activeSegmentCount++;
+                appliedDiagnosticVersion = nextDiagnosticVersion;
+                AndroidLog.Debug(LogTag,
+                    $"GEOJSON DIAGNOSTIC LINES: {activeSegmentCount}/{diagnosticLines.Length} rendered.");
+            }
+            return activeSegmentCount > 0;
+        }
+
+        if (appliedDiagnosticVersion != -1)
+        {
+            DisableAll(slots);
+            appliedDiagnosticVersion = -1;
+            appliedRouteVersion = -1;
+        }
+
         ARRouteBridge.RouteSnapshot snapshot =
             ARRouteBridge.Current;
 
@@ -339,7 +438,7 @@ public static class ARRouteRenderer
         ARRouteGeometrySanitizer.GeometryPreparationResult prepared =
             ARRouteGeometrySanitizer.Prepare(
                 snapshot.Points,
-                slots.Length +
+                MaxRouteSegments +
                     1);
 
         IReadOnlyList<ArHorizontalRoutePoint> renderPoints =
@@ -365,14 +464,14 @@ public static class ARRouteRenderer
                 snapshot,
                 prepared,
                 0,
-                slots.Length);
+                MaxRouteSegments);
 
             return false;
         }
 
         if (renderPoints.Count -
                 1 >
-                    slots.Length ||
+                    MaxRouteSegments ||
             !prepared.FirstPointPreserved ||
             !prepared.FinalPointPreserved)
         {
@@ -390,7 +489,7 @@ public static class ARRouteRenderer
                 "Renderer rejected route geometry that exceeded the pool or " +
                 "did not preserve both route-window endpoints: " +
                 $"preparedPoints={renderPoints.Count}, " +
-                $"segmentCapacity={slots.Length}, " +
+                $"segmentCapacity={MaxRouteSegments}, " +
                 $"firstPreserved={prepared.FirstPointPreserved}, " +
                 $"finalPreserved={prepared.FinalPointPreserved}.");
 
@@ -398,7 +497,7 @@ public static class ARRouteRenderer
                 snapshot,
                 prepared,
                 0,
-                slots.Length);
+                MaxRouteSegments);
 
             return false;
         }
@@ -453,6 +552,20 @@ public static class ARRouteRenderer
                 false;
         }
 
+        if (renderedSegmentCount != requestedSegmentCount)
+        {
+            // A broken span must never leave a disconnected line or a
+            // forward arrow that appears to skip the missing road geometry.
+            DisableAll(slots);
+            DisableAll(arrows);
+            activeSegmentCount = 0;
+            ARRouteBridge.PublishGeometryQuality(
+                snapshot, prepared, 0, MaxRouteSegments);
+            AndroidLog.Warn(LogTag,
+                $"Incomplete route geometry rejected: {renderedSegmentCount}/{requestedSegmentCount} spans.");
+            return false;
+        }
+
         bool arrowVisible =
             ApplyForwardArrow(
                 arrows,
@@ -465,7 +578,7 @@ public static class ARRouteRenderer
             snapshot,
             prepared,
             renderedSegmentCount,
-            slots.Length);
+            MaxRouteSegments);
 
         AndroidLog.Debug(
             LogTag,
@@ -476,7 +589,7 @@ public static class ARRouteRenderer
             $"removedPoints={prepared.RemovedPointCount}, " +
             $"beveledCorners={prepared.BeveledCornerCount}, " +
             $"subdivisionPoints={prepared.InsertedSubdivisionPointCount}, " +
-            $"capacityResampled={prepared.WasCapacityResampled}, " +
+            $"capacityLimited={prepared.WasCapacityLimited}, " +
             $"endpointPreserved=" +
             $"{prepared.FirstPointPreserved && prepared.FinalPointPreserved}, " +
             $"maximumSegment=" +
@@ -510,6 +623,10 @@ public static class ARRouteRenderer
             activeRouteRoot = null;
             segmentSlots = [];
             arrowSlots = [];
+            segmentMaterial = null;
+            diagnosticPlacement = default;
+            diagnosticSegments = [];
+            appliedDiagnosticVersion = -1;
             appliedRouteVersion = -1;
             activeSegmentCount = 0;
             boundGraphicsGeneration = 0;
@@ -555,27 +672,57 @@ public static class ARRouteRenderer
                 arrowSlots;
         }
 
+        if (CurrentRoadDiagnosticPlacement.Active)
+        {
+            // Raw data inspection shows every line, including those that
+            // would normally be hidden by the depth-based guidance policy.
+            foreach (SegmentSlot slot in slots)
+                ResetOcclusionState(slot, visible: true);
+            DisableAll(arrows);
+            return;
+        }
+
         ARDepthOcclusionBridge.DepthSnapshot depth =
             ARFrameCoherencePolicy.GetDepthForSpatialFrame(
                 frame);
 
+        int routeSlotCount = Math.Min(slots.Length, MaxRouteSegments);
         ApplyCameraVisualPolicy(
             slots,
+            routeSlotCount,
             routeRootWorldPosition,
             frame,
             depth,
             protectNearCameraSegments: true);
 
+        // An occluded middle cube followed by visible cubes looks like a
+        // zebra crossing or a path through an obstacle. Display only the
+        // uninterrupted, visible prefix until the obstruction clears.
+        bool blocked = false;
+        for (int i = 0; i < routeSlotCount; i++)
+        {
+            SegmentSlot slot = slots[i];
+            if (!slot.GeometryAvailable) continue;
+            if (!slot.Entity.IsEnabled) blocked = true;
+            if (blocked) slot.Entity.IsEnabled = false;
+        }
+
         ApplyCameraVisualPolicy(
             arrows,
+            arrows.Length,
             routeRootWorldPosition,
             frame,
             depth,
             protectNearCameraSegments: false);
+
+        if (blocked)
+            foreach (SegmentSlot arrow in arrows)
+                arrow.Entity.IsEnabled = false;
     }
 
     private static void ApplyCameraVisualPolicy(
         SegmentSlot[] slots,
+        int slotCount,
         Vector3 routeRootWorldPosition,
         ARCameraPoseBridge.SpatialSnapshot frame,
         ARDepthOcclusionBridge.DepthSnapshot depth,
@@ -588,7 +735,7 @@ public static class ARRouteRenderer
             frame.Pose.PositionZ;
 
         for (int i = 0;
-             i < slots.Length;
+             i < slotCount;
              i++)
         {
             SegmentSlot slot =
@@ -826,8 +973,10 @@ public static class ARRouteRenderer
                 delta.X * delta.X +
                 delta.Z * delta.Z);
 
-        if (horizontalLength <=
-            0.05f)
+        // The sanitizer retains every source span of at least 1 cm. A wider
+        // renderer cutoff silently left gaps between otherwise valid pieces.
+        if (horizontalLength <
+            0.009f)
         {
             return false;
         }
@@ -1002,15 +1151,10 @@ public static class ARRouteRenderer
             180.0 /
             Math.PI;
 
-        if (turnDegrees >=
-            NoOverlapTurnDegrees)
-        {
-            return 0.0f;
-        }
-
         double overlapScale =
-            turnDegrees <=
-                FullOverlapTurnDegrees
+            turnDegrees >= NoOverlapTurnDegrees
+                ? 0.25
+                : turnDegrees <= FullOverlapTurnDegrees
                 ? 1.0
                 : (NoOverlapTurnDegrees -
                    turnDegrees) /

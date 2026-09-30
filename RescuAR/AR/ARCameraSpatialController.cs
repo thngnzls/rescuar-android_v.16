@@ -166,9 +166,6 @@ public static class ARCameraSpatialController
 
     private static bool routeHeadingTrusted;
 
-    private static string routeHeadingTrustReason =
-        "No stable map-to-AR heading alignment is available.";
-
     private static SpatialContinuitySnapshot currentSpatialContinuity =
         new(
             SpatialContinuityState.Live,
@@ -469,9 +466,6 @@ public static class ARCameraSpatialController
             routeHeadingTrusted =
                 false;
 
-            routeHeadingTrustReason =
-                "No stable map-to-AR heading alignment is available.";
-
             currentSpatialContinuity =
                 new SpatialContinuitySnapshot(
                     SpatialContinuityState.Live,
@@ -551,6 +545,7 @@ public static class ARCameraSpatialController
             graphicsGeneration);
         ARFloodDepthRenderer.TeardownGraphicsGeneration(
             graphicsGeneration);
+        ARRoadApproachRenderer.TeardownGraphicsGeneration(graphicsGeneration);
     }
 
     public static void SetRouteRenderingEnabled(
@@ -648,9 +643,6 @@ public static class ARCameraSpatialController
 
             routeHeadingTrusted =
                 false;
-
-            routeHeadingTrustReason =
-                "A new ARCore world frame requires heading alignment.";
 
             currentSpatialContinuity =
                 new SpatialContinuitySnapshot(
@@ -827,8 +819,6 @@ public static class ARCameraSpatialController
 
         bool headingTrusted;
 
-        string headingTrustReason;
-
         lock (sync)
         {
             routeAlignmentTrusted =
@@ -837,9 +827,6 @@ public static class ARCameraSpatialController
 
             headingTrusted =
                 routeHeadingTrusted;
-
-            headingTrustReason =
-                routeHeadingTrustReason;
         }
 
         SpatialContinuitySnapshot continuity =
@@ -848,7 +835,6 @@ public static class ARCameraSpatialController
                 anchor.IsAvailable,
                 routeGroundHeightPlausible,
                 headingTrusted,
-                headingTrustReason,
                 routeAlignmentTrusted,
                 frame.TrackingFailureReason,
                 frame.Version);
@@ -1146,6 +1132,30 @@ public static class ARCameraSpatialController
             }
         }
 
+        ARRouteRenderer.RoadDiagnosticPlacement roadDiagnostic =
+            ARRouteRenderer.CurrentRoadDiagnosticPlacement;
+        if (roadDiagnostic.Active)
+        {
+            bool diagnosticPlacementValid = hasRouteGeometry &&
+                trackingValid && anchor.IsAvailable &&
+                routeGroundHeightPlausible &&
+                roadDiagnostic.SessionGeneration == frame.Generation.SessionGeneration &&
+                roadDiagnostic.AnchorGeneration == anchor.ReferenceGeneration;
+            route.IsEnabled = diagnosticPlacementValid;
+            if (diagnosticPlacementValid)
+                routeRootTransform.Position = new Vector3(
+                    roadDiagnostic.X,
+                    anchor.PositionY + RouteYOffsetAboveGroundMeters,
+                    roadDiagnostic.Z);
+            hasValidRouteSpatialPlacement = false;
+        }
+
+        // Approach arrows have their own trust gates and do not need an
+        // already-published evacuation route. Raw-road diagnostics take priority.
+        if (ARRoadApproachRenderer.ProcessDrawThreadWork(frame,
+                routeGroundHeightPlausible, roadDiagnostic.Active))
+            route.IsEnabled = false;
+
         bool routeHeldFromLastValidPlacement =
             route.IsEnabled &&
             hasRouteGeometry &&
@@ -1155,7 +1165,7 @@ public static class ARCameraSpatialController
 
         ARRouteRenderer.SetDepthOcclusionRequested(
             route.IsEnabled &&
-            trackingValid);
+            trackingValid && !roadDiagnostic.Active);
 
         if (route.IsEnabled &&
             trackingValid)
@@ -1463,9 +1473,6 @@ public static class ARCameraSpatialController
 
             routeHeadingTrusted =
                 trusted;
-
-            routeHeadingTrustReason =
-                normalizedReason;
         }
 
         if (changed)
@@ -1621,7 +1628,6 @@ public static class ARCameraSpatialController
         bool anchorAvailable,
         bool groundHeightPlausible,
         bool headingTrusted,
-        string headingTrustReason,
         bool routeAlignmentTrusted,
         string trackingFailureReason,
         long spatialVersion)
@@ -1688,21 +1694,15 @@ public static class ARCameraSpatialController
                 reason =
                     "Route alignment correction is pending.";
             }
-            else if (!headingTrusted)
-            {
-                state =
-                    SpatialContinuityState.Untrusted;
-
-                reason =
-                    headingTrustReason;
-            }
             else
             {
                 state =
                     SpatialContinuityState.Live;
 
                 reason =
-                    "Spatial tracking is healthy.";
+                    headingTrusted
+                        ? "Spatial tracking is healthy."
+                        : "Spatial tracking is healthy; heading confidence is reduced.";
             }
         }
         else

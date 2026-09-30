@@ -65,13 +65,6 @@ public static class ARGuidanceConfidencePolicy
                     spatial.State));
         }
 
-        if (!headingTrusted)
-        {
-            return Hidden(
-                score,
-                "Calibrating direction — AR route hidden");
-        }
-
         if (spatial.State ==
             ARCameraSpatialController.SpatialContinuityState.ShortHold)
         {
@@ -111,6 +104,15 @@ public static class ARGuidanceConfidencePolicy
                 score,
                 false,
                 "Confirming your route position — AR route hidden");
+        }
+
+        if (!headingTrusted)
+        {
+            return new GuidanceConfidenceSnapshot(
+                GuidanceConfidenceState.Recovery,
+                score,
+                false,
+                "Direction alignment unavailable — use the 2D map");
         }
 
         bool verifiedRecovery =
@@ -161,10 +163,10 @@ public static class ARGuidanceConfidencePolicy
         if (degradedGuidance)
         {
             return new GuidanceConfidenceSnapshot(
-                GuidanceConfidenceState.Degraded,
+                GuidanceConfidenceState.Recovery,
                 score,
-                true,
-                "AR accuracy reduced — confirm with text guidance");
+                false,
+                "Position uncertain — use the 2D map until the route is verified");
         }
 
         return new GuidanceConfidenceSnapshot(

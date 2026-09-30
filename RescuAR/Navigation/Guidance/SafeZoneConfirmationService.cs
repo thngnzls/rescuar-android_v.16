@@ -7,32 +7,29 @@ namespace RescuAR.Navigation.Guidance;
 /// Conservative destination-arrival confirmation for pedestrian guidance.
 ///
 /// A safe zone is not considered reached from one GPS sample. The service
-/// requires repeated good-quality fixes that agree with both geographic
-/// facility proximity and the retained route-progress state.
+/// requires repeated good-quality fixes within the facility vicinity.
 ///
 /// Evacuation centers are areas, not mathematical points. Callers may provide
 /// a facility-specific arrival radius that covers the evacuation building /
-/// compound vicinity. The legacy 30 m radius remains the fallback.
+/// compound vicinity. The default radius is 75 m.
 /// </summary>
 public sealed class SafeZoneConfirmationService
 {
     public const int RequiredConfirmationCount =
-        3;
+        2;
 
     /// <summary>
-    /// Legacy/default radius used when no facility-specific profile exists.
-    /// Kept under the original name for compatibility with the Stage 5
-    /// developer-validation harness.
+    /// Default radius used when no facility-specific profile exists.
     /// </summary>
     public const double ArrivalRadiusMeters =
-        30.0;
+        75.0;
 
     public const double MaximumAcceptedAccuracyMeters =
-        30.0;
+        15.0;
 
     /// <summary>
-    /// Legacy minimum route-progress gate. Larger facilities automatically
-    /// receive a proportionally larger route-near-destination allowance.
+    /// Retained in the diagnostic decision for legacy callers; route progress
+    /// does not gate proximity confirmation.
     /// </summary>
     public const double MaximumRemainingRouteMeters =
         45.0;
@@ -55,9 +52,6 @@ public sealed class SafeZoneConfirmationService
     private const double CandidateResetMarginMeters =
         20.0;
 
-    private const double CandidateRouteResetMarginMeters =
-        30.0;
-
     private int confirmationCount;
     private bool confirmed;
 
@@ -70,7 +64,7 @@ public sealed class SafeZoneConfirmationService
         current;
 
     /// <summary>
-    /// Compatibility overload retaining the original 30 m behavior.
+    /// Compatibility overload using the default facility radius.
     /// </summary>
     public SafeZoneDecision Evaluate(
         GeoCoordinate currentCoordinate,
@@ -100,7 +94,8 @@ public sealed class SafeZoneConfirmationService
         double arrivalRadiusMeters,
         double? accuracyMeters,
         double remainingRouteMeters,
-        DateTimeOffset observedAt)
+        DateTimeOffset observedAt,
+        bool majorRoadBarrier = false)
     {
         double effectiveArrivalRadiusMeters =
             NormalizeArrivalRadius(
@@ -117,12 +112,6 @@ public sealed class SafeZoneConfirmationService
                 CandidateResetDistanceMeters,
                 effectiveArrivalRadiusMeters +
                     CandidateResetMarginMeters);
-
-        double effectiveCandidateResetRemainingRouteMeters =
-            Math.Max(
-                CandidateResetRemainingRouteMeters,
-                effectiveMaximumRemainingRouteMeters +
-                    CandidateRouteResetMarginMeters);
 
         if (!currentCoordinate.IsValid ||
             !destinationCoordinate.IsValid)
@@ -161,22 +150,14 @@ public sealed class SafeZoneConfirmationService
             accuracyMeters!.Value <=
                 MaximumAcceptedAccuracyMeters;
 
-        bool remainingIsFinite =
-            double.IsFinite(
-                remainingRouteMeters) &&
-            remainingRouteMeters >=
-                0.0;
-
+        // The accuracy margin keeps a GPS fix on the outer boundary from
+        // confirming a facility on the opposite side of that boundary.
         bool withinArrivalRadius =
-            double.IsFinite(
-                distanceToDestinationMeters) &&
-            distanceToDestinationMeters <=
+            accuracyIsAcceptable &&
+            !majorRoadBarrier &&
+            double.IsFinite(distanceToDestinationMeters) &&
+            distanceToDestinationMeters + accuracyMeters!.Value <=
                 effectiveArrivalRadiusMeters;
-
-        bool routeIsNearDestination =
-            remainingIsFinite &&
-            remainingRouteMeters <=
-                effectiveMaximumRemainingRouteMeters;
 
         if (confirmed)
         {
@@ -193,14 +174,12 @@ public sealed class SafeZoneConfirmationService
                     MaximumRemainingRouteMeters: effectiveMaximumRemainingRouteMeters,
                     AccuracyMeters: accuracyMeters,
                     ObservedAt: observedAt,
-                    Reason: "Safe-zone arrival is already confirmed.");
+                    Reason: "Evacuation-center vicinity has already been confirmed; entry is unverified.");
 
             return current;
         }
 
-        if (accuracyIsAcceptable &&
-            withinArrivalRadius &&
-            routeIsNearDestination)
+        if (withinArrivalRadius)
         {
             bool isNewGpsObservation =
                 !lastCountedObservationTime.HasValue ||
@@ -237,9 +216,9 @@ public sealed class SafeZoneConfirmationService
                     AccuracyMeters: accuracyMeters,
                     ObservedAt: observedAt,
                     Reason: confirmed
-                        ? "Repeated GPS and route-progress checks confirm entry into the evacuation-center safe-zone vicinity."
+                        ? "Repeated accurate GPS fixes confirm the evacuation-center vicinity; facility entry has not been verified."
                         : isNewGpsObservation
-                            ? "GPS and route progress both indicate the user is inside the evacuation-center safe-zone vicinity."
+                            ? "Accurate GPS indicates the evacuation-center vicinity; waiting for a second fix."
                             : "Duplicate or stale GPS observation held; waiting for a newer fix.");
 
             return current;
@@ -251,13 +230,7 @@ public sealed class SafeZoneConfirmationService
             distanceToDestinationMeters >
                 effectiveCandidateResetDistanceMeters;
 
-        bool clearlyTooMuchRouteRemaining =
-            remainingIsFinite &&
-            remainingRouteMeters >
-                effectiveCandidateResetRemainingRouteMeters;
-
-        if (clearlyOutsideDestination ||
-            clearlyTooMuchRouteRemaining)
+        if (clearlyOutsideDestination || majorRoadBarrier)
         {
             confirmationCount =
                 0;
@@ -267,14 +240,14 @@ public sealed class SafeZoneConfirmationService
         }
 
         string reason =
-            !accuracyIsFinite
+            majorRoadBarrier
+                ? "A mapped major road separates this position from the evacuation center."
+                : !accuracyIsFinite
                 ? "GPS accuracy is unavailable."
                 : !accuracyIsAcceptable
                     ? $"GPS accuracy exceeds {MaximumAcceptedAccuracyMeters:F0} m."
                     : !withinArrivalRadius
-                        ? $"User is outside the {effectiveArrivalRadiusMeters:F0} m safe-zone radius."
-                        : !routeIsNearDestination
-                            ? $"Route has more than {effectiveMaximumRemainingRouteMeters:F0} m remaining."
+                        ? $"User and GPS accuracy margin extend beyond the {effectiveArrivalRadiusMeters:F0} m arrival radius."
                             : "Arrival conditions are not satisfied.";
 
         current =

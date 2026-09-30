@@ -9,8 +9,13 @@ namespace RescuAR.Navigation.Progress;
 /// </summary>
 public sealed class RouteReplacementPolicy
 {
-    private const double MaximumEndpointOffsetMeters =
-        150.0;
+    // The AR publisher refuses to align a route beginning over 20 m from
+    // the user's GPS position. Reject it here before replacing route state.
+    private const double MaximumOriginOffsetMeters =
+        20.0;
+
+    private const double MaximumDestinationOffsetMeters =
+        50.0;
 
     private const double MinimumGeometryConsistencyAllowanceMeters =
         75.0;
@@ -120,7 +125,7 @@ public sealed class RouteReplacementPolicy
         if (!double.IsFinite(
                 startOffsetMeters) ||
             startOffsetMeters >
-                MaximumEndpointOffsetMeters)
+                MaximumOriginOffsetMeters)
         {
             return Reject(
                 $"replacement route begins {startOffsetMeters:F1} m from the requested origin");
@@ -129,7 +134,7 @@ public sealed class RouteReplacementPolicy
         if (!double.IsFinite(
                 destinationOffsetMeters) ||
             destinationOffsetMeters >
-                MaximumEndpointOffsetMeters)
+                MaximumDestinationOffsetMeters)
         {
             return Reject(
                 $"replacement route ends {destinationOffsetMeters:F1} m from the destination");
@@ -208,6 +213,10 @@ public sealed class RouteReplacementPolicy
                 pendingCandidate.Value.Algorithm,
                 replacementRoute.Algorithm,
                 StringComparison.Ordinal) &&
+            pendingCandidate.Value.RouteStart.DistanceTo(
+                firstPoint.Coordinate) <= 15.0 &&
+            pendingCandidate.Value.RouteEnd.DistanceTo(
+                lastPoint.Coordinate) <= 10.0 &&
             Math.Abs(
                 pendingCandidate.Value.DistanceMeters -
                 replacementRoute.TotalDistanceMeters) <=
@@ -231,6 +240,8 @@ public sealed class RouteReplacementPolicy
                 requestedDestination,
                 replacementRoute.Algorithm,
                 replacementRoute.TotalDistanceMeters,
+                firstPoint.Coordinate,
+                lastPoint.Coordinate,
                 timestampUtc);
 
         return new RouteReplacementDecision(
@@ -273,6 +284,8 @@ public sealed class RouteReplacementPolicy
         GeoCoordinate Destination,
         string Algorithm,
         double DistanceMeters,
+        GeoCoordinate RouteStart,
+        GeoCoordinate RouteEnd,
         DateTimeOffset TimestampUtc);
 }
 

@@ -28,7 +28,7 @@ public class CommunityReport : BaseModel
     public double Longitude { get; set; }
 
     [Column("posted_by")]
-    public string PostedBy { get; set; } = "Aubrey T.";
+    public string PostedBy { get; set; } = "Anonymous Resident";
 
     [Column("category")]
     public string Category { get; set; } = "Flood Warning";
@@ -63,6 +63,9 @@ public class CommunityReport : BaseModel
 
     [JsonIgnore]
     public string DistanceText { get; set; } = "320 meters away";
+
+    [JsonIgnore]
+    public double DistanceKm { get; set; } = double.MaxValue;
 
     [JsonIgnore]
     public bool IsLikedByCurrentUser { get; set; }

@@ -1,3 +1,4 @@
+using RescuAR.AR;
 using Android.Content;
 using Android.Hardware;
 using Android.Util;
@@ -15,31 +16,38 @@ namespace RescuAR.MAUI.Platforms.Android.Services;
 /// </summary>
 public sealed partial class ArCoreService
 {
+#if RESCUAR_DIAGNOSTICS
     private const string ForceDepthOffIntentExtra =
         "rescuar.arcore.force_depth_off";
+#endif
 
     private static bool IsDepthDisabledForControlledRetest()
     {
+        // A native depth-worker abort cannot be caught by managed exception
+        // handling. Use the existing plane-only path on field-confirmed profiles.
+        bool affectedProfile = ARDepthCompatibilityPolicy.DisableAutomaticDepth(
+            AndroidBuild.Model, (int)AndroidBuild.VERSION.SdkInt);
+#if RESCUAR_DIAGNOSTICS
         try
         {
-            return global::Microsoft.Maui.ApplicationModel.Platform
-                .CurrentActivity?
-                .Intent?
-                .GetBooleanExtra(
-                    ForceDepthOffIntentExtra,
-                    false) ??
-                false;
+            var intent = global::Microsoft.Maui.ApplicationModel.Platform
+                .CurrentActivity?.Intent;
+            if (intent?.GetBooleanExtra("rescuar.arcore.force_depth_on", false) == true)
+                return false;
+            if (intent?.GetBooleanExtra(ForceDepthOffIntentExtra, false) == true)
+                return true;
         }
         catch (Exception exception)
         {
-            Log.Warn(
-                Tag,
-                "Could not read the controlled Depth-test launch flag; " +
-                "continuing with normal on-demand Depth. " +
+            Log.Warn(Tag, "Could not read diagnostic Depth flag: " +
                 DiagnosticPrivacyPolicy.FormatException(exception));
-
-            return false;
         }
+#endif
+        if (affectedProfile)
+            Log.Warn(Tag,
+                "Depth disabled on known native-crash device/OS profile; " +
+                "using Plane-only ground acquisition.");
+        return affectedProfile;
     }
 
     private void LogDeviceCompatibilityProfile(

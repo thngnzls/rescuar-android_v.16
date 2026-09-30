@@ -7,6 +7,7 @@ using Evergine.Framework.Services;
 using Evergine.Vulkan;
 using Microsoft.Maui.Handlers;
 using RescuAR;
+using RescuAR.AR;
 using RescuAR.MAUI.Evergine;
 using RescuAR.MAUI.Platforms.Android.Services;
 using RescuAR.MAUI.Services;
@@ -27,16 +28,25 @@ namespace RescuAR.MAUI.Evergine
         private AndroidWindowsSystem? windowsSystem;
         private SwapChain? swapChain;
         private VKGraphicsContext? graphicsContext;
-        private readonly object graphicsTeardownSync = new();
-        private Task? graphicsTeardownTask;
+        private readonly object graphicsDrawSync = new();
         private long graphicsGeneration;
         private int graphicsOwnerThreadId;
         private int surfaceDetachAcknowledgementLogged;
+        private int surfaceRecreationPending;
+        private int surfaceResizePending;
+        private int forceSurfaceRefresh;
+        private uint lastSwapChainWidth;
+        private uint lastSwapChainHeight;
+        private volatile bool surfaceResizeFailed;
+        private volatile bool handlerConnected;
         private volatile bool renderingEnabled =
             true;
 
         public bool IsRenderingEnabled =>
             renderingEnabled;
+
+        public bool IsSurfaceResizeFailed =>
+            surfaceResizeFailed;
 
         /*
          * Retain the concrete ARCore service once the graphics context is
@@ -99,6 +109,7 @@ namespace RescuAR.MAUI.Evergine
                     $"{typeof(MyApplication).FullName} instance on Android.");
             }
 
+
             AndroidWindowsSystem currentWindowsSystem =
                 windowsSystem
                 ?? throw new InvalidOperationException(
@@ -130,25 +141,74 @@ namespace RescuAR.MAUI.Evergine
             currentWindowsSystem.Run(
                 () =>
                 {
-                    ConfigureGraphicsContext(
-                        rescuarApplication,
-                        currentSurface);
+                    lock (graphicsDrawSync)
+                    {
+                        if (!handlerConnected) return;
+                        ConfigureGraphicsContext(
+                            rescuarApplication,
+                            currentSurface);
 
-                    application.Initialize();
+                        application.Initialize();
+                        if (Volatile.Read(ref surfaceRecreationPending) == 0 &&
+                            currentSurface.Width > 0 && currentSurface.Height > 0)
+                        {
+                            arCoreService?.NotifyGraphicsSurfaceReady();
+                        }
+                    }
                 },
-                () =>
+                () => DrawOnSurfaceOwner(application, clockTimer));
+        }
+
+        private void DrawOnSurfaceOwner(
+            global::Evergine.Framework.Application application,
+            System.Diagnostics.Stopwatch clockTimer)
+        {
+            bool idle = false;
+            lock (graphicsDrawSync)
+            {
+                // Evergine creates a new worker per SurfaceCreated. Reject
+                // callbacks from the old loop even if it overlaps recreation.
+                if (!handlerConnected ||
+                    Environment.CurrentManagedThreadId != graphicsOwnerThreadId)
                 {
-                    TimeSpan gameTime =
-                        clockTimer.Elapsed;
-
-                    clockTimer.Restart();
-
-                    application.UpdateFrame(
-                        gameTime);
-
-                    application.DrawFrame(
-                        gameTime);
-                });
+                    idle = true;
+                }
+                else
+                {
+                    ProcessPendingSurfaceResize();
+                    if (!renderingEnabled ||
+                        Volatile.Read(ref surfaceRecreationPending) != 0)
+                    {
+                        idle = true;
+                    }
+                    else
+                    {
+                        TimeSpan gameTime = TimeSpan.FromMilliseconds(
+                            Math.Min(clockTimer.Elapsed.TotalMilliseconds, 100.0));
+                        clockTimer.Restart();
+                        try
+                        {
+                            application.UpdateFrame(gameTime);
+                            application.DrawFrame(gameTime);
+                        }
+                        catch (Exception exception)
+                        {
+                            renderingEnabled = false;
+                            surfaceResizeFailed = true;
+                            Interlocked.Exchange(ref surfaceRecreationPending, 1);
+                            Interlocked.Exchange(ref forceSurfaceRefresh, 1);
+                            arCoreService?.NotifyGraphicsSurfaceLost();
+                            ARCameraSpatialController.SetRouteRenderingEnabled(
+                                false, "AR draw failed");
+                            Log.Error(VulkanTag,
+                                $"AR draw failed; waiting for surface recreation: {exception}");
+                        }
+                    }
+                }
+            }
+            // A paused engine loop otherwise spins continuously and prevents
+            // the ARCore/lifecycle workers from getting timely CPU time.
+            if (idle) Thread.Sleep(16);
         }
         protected override AndroidSurfaceView CreatePlatformView()
         {
@@ -179,6 +239,9 @@ namespace RescuAR.MAUI.Evergine
             base.ConnectHandler(
                 platformView);
 
+            handlerConnected =
+                true;
+
             AndroidSurface? surface =
                 androidSurface;
 
@@ -204,177 +267,72 @@ namespace RescuAR.MAUI.Evergine
                 surface);
         }
 
-        protected override void DisconnectHandler(
-            AndroidSurfaceView platformView)
+        protected override void DisconnectHandler(AndroidSurfaceView platformView)
         {
-            AndroidSurface? surface =
-                androidSurface;
-
-            if (surface is not null)
+            renderingEnabled = false;
+            lock (graphicsDrawSync)
             {
-                surface.OnScreenSizeChanged -=
-                    AndroidSurface_OnScreenSizeChanged;
+                handlerConnected = false;
+                AndroidSurface? surface = androidSurface;
+                if (surface is not null)
+                {
+                    surface.OnScreenSizeChanged -= AndroidSurface_OnScreenSizeChanged;
+                    surface.OnSurfaceInfoChanged -= AndroidSurface_OnSurfaceInfoChanged;
+                    surface.Closing -= AndroidSurface_OnClosing;
+                }
 
-                surface.OnSurfaceInfoChanged -=
-                    AndroidSurface_OnSurfaceInfoChanged;
-
-                surface.Closing -=
-                    AndroidSurface_OnClosing;
-            }
-
-            Task teardown =
-                StartGraphicsTeardown(
-                    "MAUI handler disconnect");
-
-            try
-            {
-                /*
-                 * Do not let base.DisconnectHandler detach the Android
-                 * surface until the AR producer, draw callback, and Vulkan
-                 * device have all acknowledged the old generation.
-                 */
-                teardown.WaitAsync(
-                        TimeSpan.FromSeconds(18))
-                    .GetAwaiter()
-                    .GetResult();
-
-                LogSurfaceDetachAcknowledgement();
-            }
-            catch (Exception exception)
-            {
-                Log.Error(
-                    ArCoreTag,
-                    "Refusing to detach the Android rendering surface before " +
-                    $"AR/Vulkan quiescence completed: {exception}");
-
-                return;
-            }
-
-            arCoreService =
-                null;
-
-            graphicsContext =
-                null;
-
-            graphicsGeneration =
-                0;
-
-            graphicsOwnerThreadId =
-                0;
-
-            lock (graphicsTeardownSync)
-            {
-                graphicsTeardownTask = null;
-            }
-
-            lastArCoreRotation =
-                int.MinValue;
-
-            lastArCoreWidth =
-                -1;
-
-            lastArCoreHeight =
-                -1;
-
-            base.DisconnectHandler(
-                platformView);
-        }
-
-        private void AndroidSurface_OnClosing(
-            object? sender,
-            EventArgs e)
-        {
-            if (androidSurface is not { } surface)
-            {
-                return;
-            }
-
-            surface.OnScreenSizeChanged -=
-                AndroidSurface_OnScreenSizeChanged;
-
-            surface.OnSurfaceInfoChanged -=
-                AndroidSurface_OnSurfaceInfoChanged;
-
-            surface.Closing -=
-                AndroidSurface_OnClosing;
-
-            /*
-             * Closing may precede MAUI handler disconnection. Start rejecting
-             * frames immediately; DisconnectHandler consumes the same task and
-             * performs the mandatory bounded wait before base detachment.
-             */
-            if (Environment.CurrentManagedThreadId == graphicsOwnerThreadId &&
-                arCoreService is not null &&
-                graphicsContext is not null &&
-                graphicsGeneration > 0)
-            {
+                // Closing a handler is permanent. The native render loop may
+                // already have stopped, so cleanup cannot await its next draw.
                 try
                 {
-                    arCoreService.QuiesceGraphicsContextAtSurfaceBoundary(
-                        graphicsContext,
-                        graphicsGeneration,
-                        "Android surface closing on graphics-owner thread");
-
-                    lock (graphicsTeardownSync)
+                    if (arCoreService is not null && graphicsContext is not null &&
+                        graphicsGeneration > 0)
                     {
-                        graphicsTeardownTask = Task.CompletedTask;
+                        arCoreService.QuiesceGraphicsContextAtSurfaceBoundary(
+                            graphicsContext, graphicsGeneration, "MAUI handler disconnect");
+                        LogSurfaceDetachAcknowledgement();
                     }
-
-                    LogSurfaceDetachAcknowledgement();
                 }
                 catch (Exception exception)
                 {
-                    lock (graphicsTeardownSync)
-                    {
-                        graphicsTeardownTask = Task.FromException(exception);
-                    }
-
-                    Log.Error(
-                        ArCoreTag,
-                        "Owner-thread surface teardown failed: " +
-                        exception);
+                    Log.Error(ArCoreTag,
+                        $"Refusing surface detachment before graphics cleanup: {exception}");
+                    return;
                 }
 
-                return;
+                arCoreService = null;
+                graphicsContext = null;
+                graphicsGeneration = 0;
+                graphicsOwnerThreadId = 0;
+                lastSwapChainWidth = 0;
+                lastSwapChainHeight = 0;
+                Interlocked.Exchange(ref forceSurfaceRefresh, 0);
+                Interlocked.Exchange(ref surfaceRecreationPending, 0);
+                Interlocked.Exchange(ref surfaceResizePending, 0);
+                lastArCoreRotation = int.MinValue;
+                lastArCoreWidth = -1;
+                lastArCoreHeight = -1;
+                base.DisconnectHandler(platformView);
             }
-
-            _ = StartGraphicsTeardown(
-                "Android surface closing");
         }
 
-        private Task StartGraphicsTeardown(
-            string reason)
+        private void AndroidSurface_OnClosing(object? sender, EventArgs e)
         {
-            lock (graphicsTeardownSync)
+            renderingEnabled = false;
+            lock (graphicsDrawSync)
             {
-                if (graphicsTeardownTask is not null)
-                {
-                    return graphicsTeardownTask;
-                }
+                if (!handlerConnected ||
+                    Interlocked.Exchange(ref surfaceRecreationPending, 1) != 0)
+                    return;
 
-                ArCoreService? currentArCoreService =
-                    arCoreService;
-
-                VKGraphicsContext? currentGraphicsContext =
-                    graphicsContext;
-
-                long currentGraphicsGeneration =
-                    graphicsGeneration;
-
-                if (currentArCoreService is null ||
-                    currentGraphicsContext is null ||
-                    currentGraphicsGeneration <= 0)
-                {
-                    return Task.CompletedTask;
-                }
-
-                graphicsTeardownTask =
-                    currentArCoreService.QuiesceGraphicsContextAsync(
-                        currentGraphicsContext,
-                        currentGraphicsGeneration,
-                        reason);
-
-                return graphicsTeardownTask;
+                // Surface destruction is temporary. Retain the Session,
+                // importer, and device, and drain the last draw before return.
+                Interlocked.Exchange(ref forceSurfaceRefresh, 1);
+                Interlocked.Exchange(ref surfaceResizePending, 0);
+                ARCameraSpatialController.SetRouteRenderingEnabled(
+                    false, "Android AR surface lost");
+                arCoreService?.NotifyGraphicsSurfaceLost();
+                Log.Info(ArCoreTag, "ARCORE_SURFACE_PAUSED_RETAINING_CONTEXT");
             }
         }
 
@@ -394,37 +352,46 @@ namespace RescuAR.MAUI.Evergine
         }
 
         private void AndroidSurface_OnSurfaceInfoChanged(
-            object? sender,
-            SurfaceInfo surfaceInfo)
+            object? sender, SurfaceInfo surfaceInfo)
         {
-            if (androidSurface is not { } surface)
+            // The pinned Evergine backend raises this on the newly created
+            // graphics worker before that worker starts its RenderLoop.
+            lock (graphicsDrawSync)
+            {
+                if (!handlerConnected || androidSurface is not { } surface)
+                    return;
+                try
+                {
+                    arCoreService?.RebindGraphicsDrawThread();
+                    graphicsOwnerThreadId = Environment.CurrentManagedThreadId;
+                    Interlocked.Exchange(ref forceSurfaceRefresh, 1);
+                    Interlocked.Exchange(ref surfaceResizePending, 1);
+                    ScheduleResizeForRecreatedSurface();
+                    UpdateArCoreDisplayGeometry(surface);
+                }
+                catch (Exception exception)
+                {
+                    renderingEnabled = false;
+                    surfaceResizeFailed = true;
+                    arCoreService?.NotifyGraphicsSurfaceLost();
+                    Log.Error(ArCoreTag, $"Graphics worker transfer failed: {exception}");
+                }
+            }
+        }
+
+        private void ScheduleResizeForRecreatedSurface()
+        {
+            // Only the new native surface notification authorizes recreation.
+            // A layout callback can arrive while the old native handle is gone.
+            // The draw callback separately waits for nonzero dimensions.
+            if (Volatile.Read(ref surfaceRecreationPending) == 0)
             {
                 return;
             }
 
-            swapChain?.RefreshSurfaceInfo(
-                surfaceInfo);
-
-            swapChain?.ResizeSwapChain(
-                surface.Width,
-                surface.Height);
-
-            /*
-             * SurfaceInfo can change because of Android display changes or
-             * because the backing surface was recreated. Re-submit the
-             * actual Evergine viewport geometry to ARCore.
-             */
-            UpdateArCoreDisplayGeometry(
-                surface);
-
-            /*
-             * Preserve the previous handler behavior.
-             */
-            surface.OnScreenSizeChanged -=
-                AndroidSurface_OnScreenSizeChanged;
-
-            surface.OnScreenSizeChanged +=
-                AndroidSurface_OnScreenSizeChanged;
+            Interlocked.Exchange(ref surfaceRecreationPending, 0);
+            Interlocked.Exchange(ref surfaceResizePending, 1);
+            Log.Info(ArCoreTag, "ARCORE_SURFACE_RECREATED_RESIZE_PENDING");
         }
 
         private void AndroidSurface_OnScreenSizeChanged(
@@ -436,9 +403,9 @@ namespace RescuAR.MAUI.Evergine
                 return;
             }
 
-            swapChain?.ResizeSwapChain(
-                surface.Width,
-                surface.Height);
+            Interlocked.Exchange(
+                ref surfaceResizePending,
+                1);
 
             /*
              * This is the key connection between Evergine's real render
@@ -446,6 +413,80 @@ namespace RescuAR.MAUI.Evergine
              */
             UpdateArCoreDisplayGeometry(
                 surface);
+        }
+
+        private void ProcessPendingSurfaceResize()
+        {
+            if (Volatile.Read(ref surfaceResizePending) == 0 ||
+                !handlerConnected ||
+                Volatile.Read(ref surfaceRecreationPending) != 0 ||
+                Environment.CurrentManagedThreadId != graphicsOwnerThreadId ||
+                androidSurface is not { } surface ||
+                swapChain is not { } currentSwapChain ||
+                surface.Width <= 0 ||
+                surface.Height <= 0)
+            {
+                return;
+            }
+
+            if (Interlocked.Exchange(ref surfaceResizePending, 0) == 0)
+            {
+                return;
+            }
+
+            // SurfaceView can deliver the initial surface notification after
+            // CreateSwapChain. Rebuilding that very same swap chain on its
+            // first draw needlessly invalidates images already in use.
+            if (Volatile.Read(ref forceSurfaceRefresh) == 0 &&
+                lastSwapChainWidth == surface.Width &&
+                lastSwapChainHeight == surface.Height)
+            {
+                Log.Info(VulkanTag, "ARCORE_DUPLICATE_SURFACE_RESIZE_SKIPPED");
+                return;
+            }
+
+            try
+            {
+                if (Volatile.Read(ref forceSurfaceRefresh) != 0)
+                    currentSwapChain.RefreshSurfaceInfo(surface.SurfaceInfo);
+                if (lastSwapChainWidth != surface.Width ||
+                    lastSwapChainHeight != surface.Height)
+                {
+                    EvergineArCameraFrameImporter.WaitForGraphicsDeviceIdle(
+                        graphicsContext ?? throw new InvalidOperationException(
+                            "Graphics context is unavailable."));
+                    currentSwapChain.ResizeSwapChain(surface.Width, surface.Height);
+                }
+                lastSwapChainWidth = surface.Width;
+                lastSwapChainHeight = surface.Height;
+                Interlocked.Exchange(ref forceSurfaceRefresh, 0);
+                Log.Info(VulkanTag,
+                    $"ARCORE_SURFACE_RESIZED width={surface.Width}, " +
+                    $"height={surface.Height}.");
+                surfaceResizeFailed = false;
+                renderingEnabled = true;
+                arCoreService?.NotifyGraphicsSurfaceReady();
+            }
+            catch (Exception exception)
+            {
+                // A failed Vulkan format negotiation must not crash the UI
+                // thread or keep submitting frames to an invalid swap chain.
+                SuspendRendering();
+                if (!surfaceResizeFailed)
+                {
+                    arCoreService?.NotifyGraphicsSurfaceLost();
+                }
+                surfaceResizeFailed = true;
+                Interlocked.Exchange(ref surfaceRecreationPending, 1);
+                Interlocked.Exchange(ref forceSurfaceRefresh, 1);
+                ARCameraSpatialController.SetRouteRenderingEnabled(
+                    false,
+                    "Android surface resize failed");
+                Log.Error(
+                    VulkanTag,
+                    "AR surface resize failed; waiting for the next valid " +
+                    $"surface geometry: {exception}");
+            }
         }
 
         private void ConfigureGraphicsContext(
@@ -541,11 +582,6 @@ namespace RescuAR.MAUI.Evergine
             application.BindArGraphicsGeneration(
                 createdGraphicsGeneration);
 
-            lock (graphicsTeardownSync)
-            {
-                graphicsTeardownTask = null;
-            }
-
             /*
              * At this point Evergine has supplied its actual Android surface.
              * Use that surface rather than the Activity DecorView for ARCore's
@@ -595,6 +631,9 @@ namespace RescuAR.MAUI.Evergine
             swapChain =
                 createdGraphicsContext.CreateSwapChain(
                     swapChainDescription);
+
+            lastSwapChainWidth = surface.Width;
+            lastSwapChainHeight = surface.Height;
 
             swapChain.VerticalSync =
                 true;
