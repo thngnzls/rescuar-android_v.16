@@ -11294,10 +11294,13 @@ namespace RescuAR.App.Views.Camera
                 if (currentMap == null) return;
                 currentMap.Widgets.Clear();
 
-                // 1. Ensure accurate Marikina GeoJSON Road Network from Navigation Data Bootstrap is rendered
-                _ = EnsureCamera2DGeoJsonLoadedAsync(currentMap);
+                // 1. Ensure base OpenStreetMap tile layer is loaded with compliant User-Agent
+                _ = EnsureCamera2DOpenStreetMapLoadedAsync(currentMap);
 
-                // 2. Remove existing dynamic route & marker layers
+                // 2. Remove existing dynamic route, roads & marker layers
+                var existingRoads = currentMap.Layers.FirstOrDefault(l => l.Name == "Camera2DRoadsLayer");
+                if (existingRoads != null) currentMap.Layers.Remove(existingRoads);
+
                 var existingRoute = currentMap.Layers.FirstOrDefault(l => l.Name == "Camera2DRouteLayer");
                 if (existingRoute != null) currentMap.Layers.Remove(existingRoute);
 
@@ -11350,7 +11353,7 @@ namespace RescuAR.App.Views.Camera
                 }
                 catch { }
 
-                // 4. Plot active route (same calculation from Hybrid A* / MLD as AR guidance)
+                // 4. Plot active route ONLY (specific calculated road corridor following destination path)
                 if (activeRoute != null && activeRoute.Points != null && activeRoute.Points.Count >= 2)
                 {
                     var coordinates = new System.Collections.Generic.List<NetTopologySuite.Geometries.Coordinate>();
@@ -11467,82 +11470,21 @@ namespace RescuAR.App.Views.Camera
             }
         }
 
-        private static Mapsui.Layers.MemoryLayer? cachedGeoJsonRoadsLayer;
-
-        private async Task EnsureCamera2DGeoJsonLoadedAsync(Mapsui.Map map)
+        private async Task EnsureCamera2DOpenStreetMapLoadedAsync(Mapsui.Map map)
         {
             try
             {
-                if (map.Layers.Any(l => l.Name == "Camera2DRoadsLayer")) return;
-
-                // Ensure base OpenStreetMap tile layer is present underneath GeoJSON road network with compliant User-Agent
+                // Ensure base OpenStreetMap tile layer is present with compliant User-Agent
                 if (!map.Layers.Any(l => l.Name == "Camera2DOpenStreetMap"))
                 {
                     var tileLayer = Mapsui.Tiling.OpenStreetMap.CreateTileLayer("RescuAR-Mobile-Evacuation-App/1.0 (contact@rescuar.app)");
                     tileLayer.Name = "Camera2DOpenStreetMap";
                     map.Layers.Insert(0, tileLayer);
                 }
-
-                if (cachedGeoJsonRoadsLayer != null)
-                {
-                    map.Layers.Add(cachedGeoJsonRoadsLayer);
-                    map.Refresh();
-                    return;
-                }
-
-                // Load cleaned pedestrian road graph built from RescuAR/Navigation/Data/Resources/ROADS.geojson
-                var roadGraph = await NavigationDataBootstrap.GetRoadGraphAsync();
-                if (roadGraph != null && roadGraph.Edges.Count > 0)
-                {
-                    var roadFeatures = await Task.Run(() =>
-                    {
-                        var features = new System.Collections.Generic.List<Mapsui.Nts.GeometryFeature>();
-                        var drawnPairs = new System.Collections.Generic.HashSet<long>();
-
-                        foreach (var edge in roadGraph.Edges)
-                        {
-                            if (edge.From == null || edge.To == null) continue;
-                            long pairKey = ((long)Math.Min(edge.From.Id, edge.To.Id) << 32) | (uint)Math.Max(edge.From.Id, edge.To.Id);
-                            if (!drawnPairs.Add(pairKey)) continue;
-
-                            var (x1, y1) = Mapsui.Projections.SphericalMercator.FromLonLat(edge.From.Coordinate.Longitude, edge.From.Coordinate.Latitude);
-                            var (x2, y2) = Mapsui.Projections.SphericalMercator.FromLonLat(edge.To.Coordinate.Longitude, edge.To.Coordinate.Latitude);
-
-                            var line = new NetTopologySuite.Geometries.LineString(new[]
-                            {
-                                new NetTopologySuite.Geometries.Coordinate(x1, y1),
-                                new NetTopologySuite.Geometries.Coordinate(x2, y2)
-                            });
-
-                            var feat = new Mapsui.Nts.GeometryFeature(line);
-                            features.Add(feat);
-                        }
-
-                        return features;
-                    });
-
-                    var roadLayer = new Mapsui.Layers.MemoryLayer
-                    {
-                        Name = "Camera2DRoadsLayer",
-                        Features = roadFeatures,
-                        Style = new Mapsui.Styles.VectorStyle
-                        {
-                            Line = new Mapsui.Styles.Pen
-                            {
-                                Color = new Mapsui.Styles.Color(71, 85, 105, 230), // Slate Gray Street Network #475569
-                                Width = 2.2
-                            }
-                        }
-                    };
-
-                    cachedGeoJsonRoadsLayer = roadLayer;
-                    map.Layers.Add(roadLayer);
-                    map.Refresh();
-                }
             }
             catch (Exception ex)
             {
-                System.Diagnostics.Debug.WriteLine($"Error loading GeoJSON roads: {ex.Message}");
+                System.Diagnostics.Debug.WriteLine($"Error loading OpenStreetMap base layer: {ex.Message}");
             }
         }
 

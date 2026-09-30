@@ -2,108 +2,59 @@
 <ContentPage
     xmlns="http://schemas.microsoft.com/dotnet/2021/maui"
     xmlns:x="http://schemas.microsoft.com/winfx/2009/xaml"
+    xmlns:skia="clr-namespace:SkiaSharp.Views.Maui.Controls;assembly=SkiaSharp.Views.Maui.Controls"
     xmlns:vm="clr-namespace:RescuAR.App.ViewModels.Authentication"
     x:DataType="vm:SplashViewModel"
     x:Class="RescuAR.App.Views.Authentication.SplashPage"
     Shell.NavBarIsVisible="False"
     NavigationPage.HasNavigationBar="False"
-    BackgroundColor="#FFFFFF">
+    BackgroundColor="#0B132B">
 
-    <Grid RowDefinitions="*, Auto" Padding="32,0">
+    <Grid HorizontalOptions="FillAndExpand" VerticalOptions="FillAndExpand">
+        
+        <!-- Deep Ambient Gradient Background -->
+        <BoxView BackgroundColor="#0B132B" HorizontalOptions="FillAndExpand" VerticalOptions="FillAndExpand" />
 
-        <!-- Center Brand Anchor -->
-        <VerticalStackLayout x:Name="BrandContainer"
-                             Grid.Row="0" 
-                             HorizontalOptions="Center" 
-                             VerticalOptions="Center"
-                             Spacing="20"
-                             Opacity="0">
+        <!-- Center Stage Stack -->
+        <VerticalStackLayout HorizontalOptions="Center" 
+                             VerticalOptions="Center" 
+                             Spacing="40">
             
-            <!-- Sleek Insignia Frame (White & Teal) -->
-            <Border WidthRequest="112"
-                    HeightRequest="112"
-                    StrokeThickness="2"
-                    Stroke="#E2E8F0"
-                    StrokeShape="RoundRectangle 28"
-                    BackgroundColor="#F8FAFC"
+            <!-- Radar on Top of Map Display Widget -->
+            <Border x:Name="RadarBorder"
+                    WidthRequest="270"
+                    HeightRequest="270"
+                    StrokeThickness="2.5"
+                    Stroke="#1E3A5F"
+                    StrokeShape="RoundRectangle 135"
+                    BackgroundColor="#0D1B36"
                     HorizontalOptions="Center"
-                    Padding="18">
+                    Padding="0">
                 <Border.Shadow>
-                    <Shadow Brush="#0A8491" Offset="0,6" Radius="24" Opacity="0.15" />
+                    <Shadow Brush="#0A8491" Offset="0,0" Radius="36" Opacity="0.55" />
                 </Border.Shadow>
-                <Image Source="splash.svg"
-                       WidthRequest="76"
-                       HeightRequest="76"
-                       Aspect="AspectFit"
-                       HorizontalOptions="Center"
-                       VerticalOptions="Center" />
+
+                <skia:SKCanvasView x:Name="RadarCanvas"
+                                   WidthRequest="270"
+                                   HeightRequest="270"
+                                   PaintSurface="OnRadarCanvasPaintSurface"
+                                   HorizontalOptions="Fill"
+                                   VerticalOptions="Fill" />
             </Border>
-            
-            <!-- Brand Identity -->
-            <VerticalStackLayout Spacing="8" HorizontalOptions="Center">
-                <HorizontalStackLayout HorizontalOptions="Center" Spacing="0">
-                    <Label Text="Rescu"
-                           FontSize="38"
-                           FontAttributes="Bold"
-                           TextColor="#0F172A"
-                           CharacterSpacing="1.2" />
-                    <Label Text="AR"
-                           FontSize="38"
-                           FontAttributes="Bold"
-                           TextColor="#0A8491"
-                           CharacterSpacing="1.2" />
-                </HorizontalStackLayout>
 
-                <!-- Civic System Badge -->
-                <Border StrokeShape="RoundRectangle 12"
-                        BackgroundColor="#E6F4F2"
-                        Stroke="#BCE3DF"
-                        StrokeThickness="1"
-                        Padding="14,5"
-                        HorizontalOptions="Center">
-                    <Label Text="OFFLINE EVACUATION GUIDANCE"
-                           FontSize="10"
-                           FontAttributes="Bold"
-                           TextColor="#0A8491"
-                           CharacterSpacing="1.4"
-                           HorizontalTextAlignment="Center" />
-                </Border>
-
-                <Label Text="City of Marikina Emergency Navigation"
-                       FontSize="13"
-                       TextColor="#64748B"
-                       CharacterSpacing="0.4"
-                       Margin="0,2,0,0"
-                       HorizontalTextAlignment="Center" />
-            </VerticalStackLayout>
-        </VerticalStackLayout>
-
-        <!-- Bottom Telemetry & Loading State -->
-        <VerticalStackLayout x:Name="LoadingContainer"
-                             Grid.Row="1"
-                             HorizontalOptions="Center"
-                             VerticalOptions="End"
-                             Margin="0,0,0,52"
-                             Spacing="12"
-                             Opacity="0">
-
-            <ActivityIndicator IsRunning="True"
-                               Color="#0A8491"
-                               WidthRequest="24"
-                               HeightRequest="24"
-                               HorizontalOptions="Center" />
-
-            <Label Text="{Binding StatusText}"
-                   FontSize="12.5"
-                   TextColor="#64748B"
-                   CharacterSpacing="0.3"
-                   HorizontalTextAlignment="Center" />
-
-            <Label Text="MARIKINA CIVIC TECH • v1.0"
-                   FontSize="10"
-                   TextColor="#94A3B8"
-                   CharacterSpacing="1.2"
-                   HorizontalTextAlignment="Center" />
+            <!-- Only RescuAR Brand Text Visible -->
+            <HorizontalStackLayout HorizontalOptions="Center" Spacing="0">
+                <Label Text="Rescu"
+                       FontSize="40"
+                       FontAttributes="Bold"
+                       TextColor="#FFFFFF"
+                       CharacterSpacing="1.5" />
+                <Label Text="AR"
+                       FontSize="40"
+                       FontAttributes="Bold"
+                       TextColor="#0A8491"
+                       CharacterSpacing="1.5" />
+            </HorizontalStackLayout>
         </VerticalStackLayout>
         
     </Grid>
